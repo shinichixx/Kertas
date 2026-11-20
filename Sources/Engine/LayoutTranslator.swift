@@ -103,9 +103,17 @@ enum LayoutTranslator {
                 out.append(contentsOf: styled(ocrText, rect: rect, page: page, size: size, image: image, digital: hasDigitalText))
                 group = []
             }
-            for w in words.sorted(by: { $0.rect.minX < $1.rect.minX }) {
+            for var w in words.sorted(by: { $0.rect.minX < $1.rect.minX }) {
                 // A lone ":" is the divider of a "Label : value" row: keep it as its own cell.
                 if w.text == ":" { emit(); group = [w]; emit(); continue }
+                // ":Execute" read as one word: split off the colon.
+                if w.text.hasPrefix(":"), w.text.count > 1 {
+                    let share = w.rect.width / CGFloat(w.text.count)
+                    emit()
+                    group = [(":", CGRect(x: w.rect.minX, y: w.rect.minY, width: share, height: w.rect.height))]
+                    emit()
+                    w = (String(w.text.dropFirst()), CGRect(x: w.rect.minX + share * 1.5, y: w.rect.minY, width: w.rect.width - share * 1.5, height: w.rect.height))
+                }
                 if let last = group.last, w.rect.minX - last.rect.maxX > max(lineH * 1.4, 12) { emit() }
                 group.append(w)
             }
@@ -176,12 +184,16 @@ enum LayoutTranslator {
         guard let full = page.string, !text.isEmpty else { return nil }
         let ns = full as NSString
         let tokens = text.split(separator: " ").map { NSRegularExpression.escapedPattern(for: String($0)) }
-        guard !tokens.isEmpty, let re = try? NSRegularExpression(pattern: tokens.joined(separator: "\\s+")) else { return nil }
+        guard !tokens.isEmpty, let re = try? NSRegularExpression(pattern: tokens.joined(separator: "\\s*")) else { return nil }
         func box(_ r: NSRange) -> CGRect? {
             guard r.length > 0, let sel = page.selection(for: r) else { return nil }
             let n = PageRenderer.displayRect(fromPage: sel.bounds(for: page), on: page)
             let rect = CGRect(x: n.minX * size.width, y: n.minY * size.height, width: n.width * size.width, height: n.height * size.height)
-            return rect.width > 0 && rect.height > 0 ? rect : nil
+            guard rect.width > 0, rect.height > 0 else { return nil }
+            // Clamp to the line that was seen, in case PDFKit's box reaches into the next line.
+            let top = max(rect.minY, target.minY - target.height * 0.25)
+            let bottom = min(rect.maxY, target.maxY + target.height * 0.25)
+            return bottom > top ? CGRect(x: rect.minX, y: top, width: rect.width, height: bottom - top) : nil
         }
         // The occurrence that sits where the text was seen on the page.
         var best: (NSRange, CGRect)?
@@ -193,7 +205,7 @@ enum LayoutTranslator {
             if score > bestScore { bestScore = score; best = (m.range, r) }
         }
         guard let (range, rect) = best, bestScore > target.width * target.height * 0.3,
-              rect.height < target.height * 2.2 else { return nil }
+              rect.height < target.height * 1.35, abs(rect.midY - target.midY) < target.height * 0.4 else { return nil }
 
         // A colon with space (or nothing) before it and space after it divides a table row.
         let sub = ns.substring(with: range) as NSString
@@ -203,9 +215,10 @@ enum LayoutTranslator {
         }
         var colon = -1
         for i in 0..<sub.length where sub.character(at: i) == 58 {
+            // Stand-alone divider: start of the text or a space before it ("Label : value", ":value").
+            // "Telephone: +603" has a letter before the colon, so it isn't split.
             let before = i == 0 || isSpace(i - 1)
-            let after = i == sub.length - 1 || isSpace(i + 1)
-            if before && after { colon = i; break }
+            if before && i < sub.length - 1 { colon = i; break }
         }
         guard colon >= 0 else { return [(text, rect)] }
         func trimmed(_ start: Int, _ end: Int) -> NSRange? {
