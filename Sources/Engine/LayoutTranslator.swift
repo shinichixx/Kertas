@@ -52,18 +52,21 @@ enum LayoutTranslator {
     // MARK: Finding text
 
     private static func segments(_ page: PDFPage) -> [Segment]? {
-        guard let attr = page.attributedString, attr.length > 0 else { return nil }
-        let ns = attr.string as NSString
-        guard ns.trimmingCharacters(in: .whitespacesAndNewlines).count > 0 else { return nil }
+        // Letters and their positions must come from the same source: page.string and
+        // characterBounds share one index. (The attributed string can have extra line breaks,
+        // which made positions drift in build 7.)
+        guard let str = page.string, !str.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let ns = str as NSString
         let size = PageRenderer.displaySize(page)
-        var out: [Segment] = []
-        var cur: Segment?
+        struct Raw { var text: String; var rect: CGRect; var start: Int; var end: Int }
+        var raws: [Raw] = []
+        var cur: Raw?
         var lastRect: CGRect = .null
 
         func flush() {
             if var c = cur, !c.text.trimmingCharacters(in: .whitespaces).isEmpty {
                 c.text = c.text.trimmingCharacters(in: .whitespaces)
-                out.append(c)
+                raws.append(c)
             }
             cur = nil
             lastRect = .null
@@ -80,31 +83,66 @@ enum LayoutTranslator {
             }
             let n = PageRenderer.displayRect(fromPage: b, on: page)
             let r = CGRect(x: n.minX * size.width, y: n.minY * size.height, width: n.width * size.width, height: n.height * size.height)
-            let font = attr.attribute(.font, at: i, effectiveRange: nil) as? UIFont
-            let color = attr.attribute(.foregroundColor, at: i, effectiveRange: nil) as? UIColor ?? .black
-            let fsize = font?.pointSize ?? r.height
+            let approx = max(r.height * 0.85, 4)
             if var c = cur, !lastRect.isNull {
                 let sameLine = abs(r.midY - lastRect.midY) < max(r.height, lastRect.height) * 0.6
                 let gap = r.minX - lastRect.maxX
-                let columnGap = gap > max(fsize * 1.6, 12)
-                if sameLine && !columnGap && gap > -fsize {
+                let columnGap = gap > max(approx * 1.6, 12)
+                if sameLine && !columnGap && gap > -approx {
                     c.text += String(utf16CodeUnits: [ch], count: 1)
                     c.rect = c.rect.union(r)
+                    c.end = i
                     cur = c
                     lastRect = r
                     continue
                 }
                 flush()
             }
-            let name = font?.fontName ?? "Helvetica"
-            let parsed = FontLibrary.parse(name)
-            cur = Segment(text: String(utf16CodeUnits: [ch], count: 1), rect: r, fontName: name, size: fsize,
-                          bold: parsed.bold || (font?.fontDescriptor.symbolicTraits.contains(.traitBold) ?? false),
-                          italic: parsed.italic, color: color)
+            cur = Raw(text: String(utf16CodeUnits: [ch], count: 1), rect: r, start: i, end: i)
             lastRect = r
         }
         flush()
-        return out
+
+        // Style of each piece, read from a selection of exactly those characters.
+        return raws.map { raw in
+            var name = "Helvetica", fsize = raw.rect.height * 0.8, color = UIColor.black, boldTrait = false
+            if let sel = page.selection(for: NSRange(location: raw.start, length: raw.end - raw.start + 1)),
+               let attr = sel.attributedString, attr.length > 0 {
+                let s2 = attr.string as NSString
+                var k = 0
+                while k < s2.length - 1, let u = Unicode.Scalar(s2.character(at: k)), CharacterSet.whitespacesAndNewlines.contains(u) { k += 1 }
+                if let f = attr.attribute(.font, at: k, effectiveRange: nil) as? UIFont {
+                    name = f.fontName
+                    fsize = f.pointSize
+                    boldTrait = f.fontDescriptor.symbolicTraits.contains(.traitBold)
+                }
+                if let c = attr.attribute(.foregroundColor, at: k, effectiveRange: nil) as? UIColor { color = c }
+            }
+            // Guard against odd size reports: the letters' own height is the truth.
+            if fsize <= 1 || fsize > raw.rect.height * 2.2 || fsize < raw.rect.height * 0.45 { fsize = raw.rect.height * 0.8 }
+            let parsed = FontLibrary.parse(name)
+            return Segment(text: raw.text, rect: raw.rect, fontName: name, size: fsize, bold: parsed.bold || boldTrait,
+                           italic: parsed.italic, color: color)
+        }
+    }
+
+    /// Checks each block against the text PDFKit finds inside its box. If many don't match,
+    /// the positions can't be trusted for that page.
+    static func trustworthy(_ blocks: [TextBlock], page: PDFPage) -> Bool {
+        let size = PageRenderer.displaySize(page)
+        let checked = blocks.filter { $0.needsTranslation }
+        guard !checked.isEmpty else { return true }
+        var good = 0
+        for b in checked {
+            let norm = CGRect(x: b.rect.minX / size.width, y: b.rect.minY / size.height, width: b.rect.width / size.width, height: b.rect.height / size.height)
+            let r = PageRenderer.pageRect(fromDisplay: norm, on: page).insetBy(dx: -1, dy: -1)
+            let found = (page.selection(for: r)?.string ?? "").lowercased()
+            let words = b.text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).filter { $0.count > 1 }
+            if words.isEmpty { good += 1; continue }
+            let hits = words.filter { found.contains($0) }.count
+            if Double(hits) / Double(words.count) >= 0.7 { good += 1 }
+        }
+        return Double(good) / Double(checked.count) >= 0.85
     }
 
     /// Scanned pages: use the lines OCR reads.

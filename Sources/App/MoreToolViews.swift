@@ -284,6 +284,7 @@ struct TranslateViewImpl: View {
     @State private var config: TranslationSession.Configuration?
     @State private var pageTexts: [String] = []
     @State private var keepDesign = true
+    @State private var fallbackNote: String?
     @State private var blocks: [[TextBlock]] = []
     @State private var layoutDoc: PDFDocument?
 
@@ -402,14 +403,30 @@ struct TranslateViewImpl: View {
         let rep = state.reporter
         let useAI: Bool = { if choice == .malay, case .ai = malay { return true }; return false }()
         let keepDesign = keepDesign
+        fallbackNote = nil
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let doc = try PDFLoader.open(url)
+                var layoutFailed = false
+                var found: [[TextBlock]] = []
                 if keepDesign {
-                    let found = LayoutTranslator.extract(doc, progress: rep)
+                    found = LayoutTranslator.extract(doc, progress: rep)
                     guard found.contains(where: { $0.contains { $0.needsTranslation } }) else { throw KertasError("No text was found in this PDF.") }
+                    // Safety check: only keep the design if every page's text lines up with its boxes.
+                    let bad = found.indices.filter { i in
+                        guard let page = doc.page(at: i), !(page.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+                        return !LayoutTranslator.trustworthy(found[i], page: page)
+                    }
+                    layoutFailed = !bad.isEmpty
+                    if layoutFailed {
+                        let pagesText = bad.map { String($0 + 1) }.joined(separator: ", ")
+                        DispatchQueue.main.async { fallbackNote = "The design couldn't be kept reliably (page \(pagesText)), so this is a plain text document instead." }
+                    }
+                }
+                if keepDesign && !layoutFailed {
+                    let captured = found
                     DispatchQueue.main.async {
-                        blocks = found
+                        blocks = captured
                         layoutDoc = doc
                         if useAI { translateLayoutWithAI(url: url, rep: rep); return }
                         triggerSession()
@@ -550,7 +567,7 @@ struct TranslateViewImpl: View {
                 let pdf = PDFOps.textPDF(title: base + " (Bahasa Melayu)", sections: sections)
                 let out = try FileStore.save(pdf, base: base + " Malay", ext: "pdf")
                 let joined = all.joined(separator: "\n\n")
-                state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: "Translated to Malay with Apple Intelligence")
+                state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: fallbackNote ?? "Translated to Malay with Apple Intelligence")
             } catch {
                 state.error = error.localizedDescription
             }
@@ -596,7 +613,7 @@ struct TranslateViewImpl: View {
             let pdf = PDFOps.textPDF(title: base + " (\(name(target)))", sections: sections)
             let out = try FileStore.save(pdf, base: base + " " + name(target), ext: "pdf")
             let joined = all.joined(separator: "\n\n")
-            state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: "Translated to \(name(target))")
+            state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: fallbackNote ?? "Translated to \(name(target))")
         } catch {
             state.error = error.localizedDescription
         }
