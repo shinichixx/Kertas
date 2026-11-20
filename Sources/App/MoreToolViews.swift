@@ -285,6 +285,8 @@ struct TranslateViewImpl: View {
     @State private var pageTexts: [String] = []
     @State private var keepDesign = true
     @State private var fallbackNote: String?
+    @State private var showBoxes = false
+    @State private var boxesURL: URL?
     @State private var blocks: [[TextBlock]] = []
     @State private var layoutDoc: PDFDocument?
 
@@ -337,6 +339,9 @@ struct TranslateViewImpl: View {
                     Text(keepDesign ? "Same layout, logo, fonts and colours, with the words translated in place."
                                     : "A clean reading copy with the translated text only.")
                         .font(.caption).foregroundStyle(.secondary)
+                    if keepDesign {
+                        Toggle("Show detected boxes", isOn: $showBoxes).font(.footnote)
+                    }
                 }
                 Button("Translate") { start() }
                     .buttonStyle(PrimaryButtonStyle(color: Tool.translate.color))
@@ -403,7 +408,9 @@ struct TranslateViewImpl: View {
         let rep = state.reporter
         let useAI: Bool = { if choice == .malay, case .ai = malay { return true }; return false }()
         let keepDesign = keepDesign
+        let showBoxes = showBoxes
         fallbackNote = nil
+        boxesURL = nil
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let doc = try PDFLoader.open(url)
@@ -411,16 +418,14 @@ struct TranslateViewImpl: View {
                 var found: [[TextBlock]] = []
                 if keepDesign {
                     found = LayoutTranslator.extract(doc, progress: rep)
-                    guard found.contains(where: { $0.contains { $0.needsTranslation } }) else { throw KertasError("No text was found in this PDF.") }
-                    // Safety check: only keep the design if every page's text lines up with its boxes.
-                    let bad = found.indices.filter { i in
-                        guard let page = doc.page(at: i), !(page.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-                        return !LayoutTranslator.trustworthy(found[i], page: page)
+                    if !found.contains(where: { $0.contains { $0.needsTranslation } }) {
+                        layoutFailed = true
+                        DispatchQueue.main.async { fallbackNote = "Plain text: no text blocks were found on the page image." }
                     }
-                    layoutFailed = !bad.isEmpty
-                    if layoutFailed {
-                        let pagesText = bad.map { String($0 + 1) }.joined(separator: ", ")
-                        DispatchQueue.main.async { fallbackNote = "The design couldn't be kept reliably (page \(pagesText)), so this is a plain text document instead." }
+                    if showBoxes {
+                        let data = LayoutTranslator.boxes(doc, blocks: found)
+                        let boxURL = try? FileStore.save(data, base: FileStore.baseName(url) + " (detected boxes)", ext: "pdf")
+                        DispatchQueue.main.async { boxesURL = boxURL }
                     }
                 }
                 if keepDesign && !layoutFailed {
@@ -536,9 +541,9 @@ struct TranslateViewImpl: View {
             let joined = all.flatMap { $0 }.compactMap(\.translated).joined(separator: "\n")
             DispatchQueue.main.async {
                 do {
-                    let out = try FileStore.save(data, base: FileStore.baseName(url) + " " + languageName, ext: "pdf")
-                    state.output = ToolOutput(urls: [out], text: String(joined.prefix(3000)) + (joined.count > 3000 ? "\n…" : ""),
-                                              message: "Translated to \(languageName), original design kept")
+                    let out = try FileStore.save(data, base: FileStore.baseName(url) + " " + languageName + " (design)", ext: "pdf")
+                    state.output = ToolOutput(urls: [out] + (boxesURL.map { [$0] } ?? []), text: String(joined.prefix(3000)) + (joined.count > 3000 ? "\n…" : ""),
+                                              message: "Original design kept · translated to \(languageName)")
                 } catch {
                     state.error = error.localizedDescription
                 }
@@ -565,9 +570,9 @@ struct TranslateViewImpl: View {
                 guard !all.isEmpty else { throw KertasError("No text was found in this PDF.") }
                 let base = FileStore.baseName(url)
                 let pdf = PDFOps.textPDF(title: base + " (Bahasa Melayu)", sections: sections)
-                let out = try FileStore.save(pdf, base: base + " Malay", ext: "pdf")
+                let out = try FileStore.save(pdf, base: base + " Malay (text)", ext: "pdf")
                 let joined = all.joined(separator: "\n\n")
-                state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: fallbackNote ?? "Translated to Malay with Apple Intelligence")
+                state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: fallbackNote ?? "Plain text · translated to Malay with Apple Intelligence")
             } catch {
                 state.error = error.localizedDescription
             }
@@ -611,9 +616,9 @@ struct TranslateViewImpl: View {
             }
             let base = FileStore.baseName(url)
             let pdf = PDFOps.textPDF(title: base + " (\(name(target)))", sections: sections)
-            let out = try FileStore.save(pdf, base: base + " " + name(target), ext: "pdf")
+            let out = try FileStore.save(pdf, base: base + " " + name(target) + " (text)", ext: "pdf")
             let joined = all.joined(separator: "\n\n")
-            state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: fallbackNote ?? "Translated to \(name(target))")
+            state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: fallbackNote ?? "Plain text · translated to \(name(target))")
         } catch {
             state.error = error.localizedDescription
         }

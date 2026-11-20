@@ -1,5 +1,6 @@
 import UIKit
 import PDFKit
+import Vision
 
 /// Finds the text blocks on each page (paragraphs, headings, table cells) so a translation
 /// can be written back in the same place, font, size and colour.
@@ -44,116 +45,150 @@ enum LayoutTranslator {
         (0..<doc.pageCount).map { i in
             progress?(Double(i) / Double(max(doc.pageCount, 1)), "Reading the layout of page \(i + 1)")
             guard let page = doc.page(at: i) else { return [] }
-            let segs = segments(page) ?? ocrSegments(page)
+            let segs = autoreleasepool { visualSegments(page) }
             return group(segs, page: i, pageWidth: PageRenderer.displaySize(page).width)
         }
     }
 
-    // MARK: Finding text
+    // MARK: Finding text where it really is
 
-    private static func segments(_ page: PDFPage) -> [Segment]? {
-        // Letters and their positions must come from the same source: page.string and
-        // characterBounds share one index. (The attributed string can have extra line breaks,
-        // which made positions drift in build 7.)
-        guard let str = page.string, !str.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let ns = str as NSString
+    /// Positions come from the rendered page (Apple's text recognition finds each line and word
+    /// where it actually appears). The words themselves come from the PDF's own text inside each
+    /// box when it matches, so nothing is misread; style comes from the PDF too.
+    private static func visualSegments(_ page: PDFPage) -> [Segment] {
         let size = PageRenderer.displaySize(page)
-        struct Raw { var text: String; var rect: CGRect; var start: Int; var end: Int }
-        var raws: [Raw] = []
-        var cur: Raw?
-        var lastRect: CGRect = .null
+        let dpi = min(220, 3000 / max(size.width, size.height) * 72)
+        let image = PageRenderer.image(page, dpi: dpi)
+        guard let cg = image.cgImage else { return [] }
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = true
+        req.automaticallyDetectsLanguage = true
+        try? VNImageRequestHandler(cgImage: cg, orientation: .up, options: [:]).perform([req])
+        let hasDigitalText = !(page.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
-        func flush() {
-            if var c = cur, !c.text.trimmingCharacters(in: .whitespaces).isEmpty {
-                c.text = c.text.trimmingCharacters(in: .whitespaces)
-                raws.append(c)
+        var out: [Segment] = []
+        for obs in req.results ?? [] {
+            guard let cand = obs.topCandidates(1).first else { continue }
+            let str = cand.string
+            // Word boxes inside this line.
+            var words: [(text: String, rect: CGRect)] = []
+            str.enumerateSubstrings(in: str.startIndex..<str.endIndex, options: .byWords) { w, range, _, _ in
+                guard let w, let box = try? cand.boundingBox(for: range)?.boundingBox else { return }
+                words.append((w, toDisplay(box, size)))
             }
-            cur = nil
-            lastRect = .null
-        }
-
-        for i in 0..<ns.length {
-            let ch = ns.character(at: i)
-            if ch == 10 || ch == 13 { flush(); continue }
-            let isSpace = ch == 32 || ch == 9 || ch == 160
-            let b = page.characterBounds(at: i)
-            if isSpace || b.width <= 0 || b.height <= 0 {
-                if cur != nil { cur!.text += " " }
-                continue
-            }
-            let n = PageRenderer.displayRect(fromPage: b, on: page)
-            let r = CGRect(x: n.minX * size.width, y: n.minY * size.height, width: n.width * size.width, height: n.height * size.height)
-            let approx = max(r.height * 0.85, 4)
-            if var c = cur, !lastRect.isNull {
-                let sameLine = abs(r.midY - lastRect.midY) < max(r.height, lastRect.height) * 0.6
-                let gap = r.minX - lastRect.maxX
-                let columnGap = gap > max(approx * 1.6, 12)
-                if sameLine && !columnGap && gap > -approx {
-                    c.text += String(utf16CodeUnits: [ch], count: 1)
-                    c.rect = c.rect.union(r)
-                    c.end = i
-                    cur = c
-                    lastRect = r
-                    continue
+            // Keep punctuation-only tokens like ":" by falling back to splitting on spaces.
+            if words.isEmpty || words.map(\.text).joined().count < str.filter({ !$0.isWhitespace }).count - 2 {
+                words = []
+                var idx = str.startIndex
+                for token in str.split(separator: " ", omittingEmptySubsequences: true) {
+                    guard let r = str.range(of: token, range: idx..<str.endIndex) else { continue }
+                    idx = r.upperBound
+                    if let box = try? cand.boundingBox(for: r)?.boundingBox { words.append((String(token), toDisplay(box, size))) }
                 }
-                flush()
             }
-            cur = Raw(text: String(utf16CodeUnits: [ch], count: 1), rect: r, start: i, end: i)
-            lastRect = r
-        }
-        flush()
+            if words.isEmpty { words = [(str, toDisplay(obs.boundingBox, size))] }
 
-        // Style of each piece, read from a selection of exactly those characters.
-        return raws.map { raw in
-            var name = "Helvetica", fsize = raw.rect.height * 0.8, color = UIColor.black, boldTrait = false
-            if let sel = page.selection(for: NSRange(location: raw.start, length: raw.end - raw.start + 1)),
-               let attr = sel.attributedString, attr.length > 0 {
-                let s2 = attr.string as NSString
-                var k = 0
-                while k < s2.length - 1, let u = Unicode.Scalar(s2.character(at: k)), CharacterSet.whitespacesAndNewlines.contains(u) { k += 1 }
-                if let f = attr.attribute(.font, at: k, effectiveRange: nil) as? UIFont {
-                    name = f.fontName
-                    fsize = f.pointSize
-                    boldTrait = f.fontDescriptor.symbolicTraits.contains(.traitBold)
-                }
-                if let c = attr.attribute(.foregroundColor, at: k, effectiveRange: nil) as? UIColor { color = c }
+            // Split the line where there's a column-sized gap.
+            let lineH = words.map(\.rect.height).max() ?? 10
+            var group: [(text: String, rect: CGRect)] = []
+            func emit() {
+                guard !group.isEmpty else { return }
+                let rect = group.dropFirst().reduce(group[0].rect) { $0.union($1.rect) }
+                let ocrText = group.map(\.text).joined(separator: " ")
+                out.append(styled(ocrText, rect: rect, page: page, size: size, image: image, digital: hasDigitalText))
+                group = []
             }
-            // Guard against odd size reports: the letters' own height is the truth.
-            if fsize <= 1 || fsize > raw.rect.height * 2.2 || fsize < raw.rect.height * 0.45 { fsize = raw.rect.height * 0.8 }
-            let parsed = FontLibrary.parse(name)
-            return Segment(text: raw.text, rect: raw.rect, fontName: name, size: fsize, bold: parsed.bold || boldTrait,
-                           italic: parsed.italic, color: color)
+            for w in words.sorted(by: { $0.rect.minX < $1.rect.minX }) {
+                if let last = group.last, w.rect.minX - last.rect.maxX > max(lineH * 1.4, 12) { emit() }
+                group.append(w)
+            }
+            emit()
         }
+        return out
     }
 
-    /// Checks each block against the text PDFKit finds inside its box. If many don't match,
-    /// the positions can't be trusted for that page.
-    static func trustworthy(_ blocks: [TextBlock], page: PDFPage) -> Bool {
-        let size = PageRenderer.displaySize(page)
-        let checked = blocks.filter { $0.needsTranslation }
-        guard !checked.isEmpty else { return true }
-        var good = 0
-        for b in checked {
-            let norm = CGRect(x: b.rect.minX / size.width, y: b.rect.minY / size.height, width: b.rect.width / size.width, height: b.rect.height / size.height)
-            let r = PageRenderer.pageRect(fromDisplay: norm, on: page).insetBy(dx: -1, dy: -1)
-            let found = (page.selection(for: r)?.string ?? "").lowercased()
-            let words = b.text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).filter { $0.count > 1 }
-            if words.isEmpty { good += 1; continue }
-            let hits = words.filter { found.contains($0) }.count
-            if Double(hits) / Double(words.count) >= 0.7 { good += 1 }
-        }
-        return Double(good) / Double(checked.count) >= 0.85
+    private static func toDisplay(_ box: CGRect, _ size: CGSize) -> CGRect {
+        CGRect(x: box.minX * size.width, y: (1 - box.maxY) * size.height, width: box.width * size.width, height: box.height * size.height)
     }
 
-    /// Scanned pages: use the lines OCR reads.
-    private static func ocrSegments(_ page: PDFPage) -> [Segment] {
-        let size = PageRenderer.displaySize(page)
-        let lines = OCR.recognize(PageRenderer.image(page, dpi: 200))
-        return lines.map { l in
-            let r = CGRect(x: l.box.minX * size.width, y: l.box.minY * size.height, width: l.box.width * size.width, height: l.box.height * size.height)
-            return Segment(text: l.text, rect: r, fontName: "Helvetica", size: max(r.height * 0.78, 4), bold: false, italic: false,
-                           color: UIColor(white: 0.12, alpha: 1))
+    private static func styled(_ ocrText: String, rect: CGRect, page: PDFPage, size: CGSize, image: UIImage, digital: Bool) -> Segment {
+        var text = ocrText
+        var name = "Helvetica"
+        var fsize = rect.height * 0.8
+        var bold = false, italic = false
+        var color: UIColor?
+        if digital {
+            let norm = CGRect(x: rect.minX / size.width, y: (rect.minY + rect.height * 0.2) / size.height,
+                              width: rect.width / size.width, height: rect.height * 0.6 / size.height)
+            let pr = PageRenderer.pageRect(fromDisplay: norm, on: page)
+            if let sel = page.selection(for: pr) {
+                let digitalText = (sel.string ?? "").components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+                if similar(digitalText, ocrText) { text = digitalText }
+                if let attr = sel.attributedString, attr.length > 0 {
+                    let ns = attr.string as NSString
+                    var k = 0
+                    while k < ns.length - 1, let u = Unicode.Scalar(ns.character(at: k)), CharacterSet.whitespacesAndNewlines.contains(u) { k += 1 }
+                    if let f = attr.attribute(.font, at: k, effectiveRange: nil) as? UIFont {
+                        name = f.fontName
+                        if f.pointSize > rect.height * 0.45 && f.pointSize < rect.height * 2.2 { fsize = f.pointSize }
+                        bold = f.fontDescriptor.symbolicTraits.contains(.traitBold)
+                    }
+                    color = attr.attribute(.foregroundColor, at: k, effectiveRange: nil) as? UIColor
+                }
+            }
         }
+        let parsed = FontLibrary.parse(name)
+        bold = bold || parsed.bold
+        italic = parsed.italic
+        return Segment(text: text, rect: rect, fontName: name, size: fsize, bold: bold, italic: italic,
+                       color: color ?? inkColour(rect, size: size, image: image))
+    }
+
+    /// Same words, ignoring case, spacing and punctuation (at least 70% of the recognised words).
+    private static func similar(_ a: String, _ b: String) -> Bool {
+        let wa = a.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        let wb = b.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        guard !wa.isEmpty, !wb.isEmpty else { return false }
+        let setA = Set(wa)
+        let hits = wb.filter { setA.contains($0) }.count
+        return Double(hits) / Double(wb.count) >= 0.7 && Double(wa.count) <= Double(wb.count) * 1.5 + 2
+    }
+
+    /// Darkest common colour inside the box: the ink.
+    private static func inkColour(_ rect: CGRect, size: CGSize, image: UIImage) -> UIColor {
+        guard let cg = image.cgImage else { return .black }
+        let sx = CGFloat(cg.width) / size.width, sy = CGFloat(cg.height) / size.height
+        let px = CGRect(x: rect.minX * sx, y: rect.minY * sy, width: rect.width * sx, height: rect.height * sy).integral
+        guard px.width > 2, px.height > 2, let crop = cg.cropping(to: px) else { return .black }
+        let w = crop.width, h = crop.height
+        var buf = [UInt8](repeating: 255, count: w * h * 4)
+        guard let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return .black }
+        ctx.draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var px3: [(Int, Int, Int)] = []
+        for i in stride(from: 0, to: buf.count, by: 4 * 3) { px3.append((Int(buf[i]), Int(buf[i + 1]), Int(buf[i + 2]))) }
+        let sorted = px3.sorted { $0.0 + $0.1 + $0.2 < $1.0 + $1.1 + $1.2 }
+        let dark = sorted.prefix(max(1, sorted.count / 20))
+        let n = Double(dark.count)
+        let r = Double(dark.reduce(0) { $0 + $1.0 }) / n, g = Double(dark.reduce(0) { $0 + $1.1 }) / n, b = Double(dark.reduce(0) { $0 + $1.2 }) / n
+        return UIColor(red: r / 255, green: g / 255, blue: b / 255, alpha: 1)
+    }
+
+    /// Draws every block it found, for checking what Kertas saw.
+    static func boxes(_ doc: PDFDocument, blocks: [[TextBlock]]) -> Data {
+        PageRenderer.render(doc, above: { i, ctx, _ in
+            guard i < blocks.count else { return }
+            for (n, b) in blocks[i].enumerated() {
+                ctx.setStrokeColor(b.needsTranslation ? UIColor.systemBlue.cgColor : UIColor.systemGray.cgColor)
+                ctx.setLineWidth(0.8)
+                ctx.stroke(b.rect)
+                UIGraphicsPushContext(ctx)
+                NSAttributedString(string: "\(n + 1)", attributes: [.font: UIFont.systemFont(ofSize: 5), .foregroundColor: UIColor.systemRed])
+                    .draw(at: CGPoint(x: b.rect.minX - 7, y: b.rect.minY))
+                UIGraphicsPopContext()
+            }
+        })
     }
 
     // MARK: Grouping lines into paragraphs
