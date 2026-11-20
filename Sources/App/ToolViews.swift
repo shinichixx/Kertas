@@ -236,7 +236,7 @@ struct ImagesToPDFView: View {
             let images: [UIImage] = files.compactMap { url in
                 guard let img = UIImage(contentsOfFile: url.path)?.normalized(maxSide: 3500) else { return nil }
                 guard straighten else { return img }
-                return Perspective.apply(.auto, to: Perspective.correct(img, quad: Perspective.detect(img)))
+                return Perspective.apply(.auto, to: TextStraightener.refine(Perspective.correct(img, quad: Perspective.detect(img))))
             }
             guard !images.isEmpty else { throw KertasError("Those images couldn't be read.") }
             if separate {

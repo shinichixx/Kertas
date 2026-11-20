@@ -9,6 +9,7 @@ struct ScanPage: Identifiable {
     var quad: Quad?
     var turns = 0
     var filter: ScanFilter = .auto
+    var straighten = true
     var result: UIImage?
     var version = 0
 }
@@ -48,7 +49,8 @@ final class ScanSession: ObservableObject {
             let out = autoreleasepool { () -> UIImage in
                 let straight = Perspective.correct(p.original, quad: p.quad)
                 let turned = Perspective.rotate(straight, quarterTurns: p.turns)
-                return Perspective.apply(p.filter, to: turned)
+                let level = p.straighten ? TextStraightener.refine(turned) : turned
+                return Perspective.apply(p.filter, to: level)
             }
             DispatchQueue.main.async {
                 if let i = self.pages.firstIndex(where: { $0.id == id }), self.pages[i].version == version {
@@ -186,8 +188,17 @@ struct ScanView: View {
                                     .background(p.filter == f ? Theme.red : Theme.chip, in: Capsule())
                             }
                         }
+                        Button { session.update(p.id) { $0.straighten.toggle() } } label: {
+                            Label("Straighten text", systemImage: p.straighten ? "checkmark.circle.fill" : "circle")
+                                .font(.footnote.weight(.medium))
+                                .padding(.horizontal, 12).padding(.vertical, 6)
+                                .foregroundStyle(p.straighten ? Theme.red : Theme.ink)
+                                .background(p.straighten ? Theme.redSoft : Theme.chip, in: Capsule())
+                        }
                         Button("Use on all") {
-                            for page in session.pages where page.id != p.id { session.update(page.id) { $0.filter = p.filter } }
+                            for page in session.pages where page.id != p.id {
+                                session.update(page.id) { $0.filter = p.filter; $0.straighten = p.straighten }
+                            }
                         }
                         .font(.footnote)
                     }
