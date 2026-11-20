@@ -275,8 +275,10 @@ enum LayoutTranslator {
         var fontSize = b.size
         var attr = NSAttributedString()
         var bounds = CGRect.zero
+        var usedFont = UIFont.systemFont(ofSize: fontSize)
         for attempt in 0..<12 {
             let font = FontLibrary.shared.font(family: family, bold: b.bold, italic: b.italic, size: fontSize)
+            usedFont = font
             attr = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: b.color, .paragraphStyle: para])
             if b.lineCount == 1 {
                 let w = attr.size().width + 1
@@ -289,7 +291,8 @@ enum LayoutTranslator {
             fontSize *= 0.96
         }
 
-        var origin = CGPoint(x: b.rect.minX, y: b.rect.minY)
+        // The detected box starts at the top of the letters; text drawing starts at the line top.
+        var origin = CGPoint(x: b.rect.minX, y: b.rect.minY - max(0, usedFont.ascender - usedFont.capHeight))
         if b.centred { origin.x = b.rect.midX - width / 2 }
         let textRect = CGRect(origin: origin, size: CGSize(width: width, height: max(bounds.height, b.rect.height)))
         let cover = b.rect.union(textRect).insetBy(dx: -1.5, dy: -1.5)
