@@ -59,8 +59,19 @@ enum PageRenderer {
         ctx.scaleBy(x: 1, y: -1)
         let natural = displaySize(page)
         ctx.scaleBy(x: size.width / natural.width, y: size.height / natural.height)
-        ctx.concatenate(page.transform(for: .cropBox))
-        page.draw(with: .cropBox, to: ctx)
+        if let cg = page.pageRef {
+            // Core Graphics' drawing transform handles the page rotation and crop box offset.
+            ctx.concatenate(cg.getDrawingTransform(.cropBox, rect: CGRect(origin: .zero, size: natural), rotate: 0, preserveAspectRatio: true))
+            ctx.clip(to: cg.getBoxRect(.cropBox))
+            ctx.drawPDFPage(cg)
+            // Filled form fields, stamps and comments drawn on top, like a viewer shows them.
+            for a in page.annotations where a.shouldDisplay && a.type != "Link" && a.type != "Popup" {
+                a.draw(with: .cropBox, in: ctx)
+            }
+        } else {
+            ctx.concatenate(page.transform(for: .cropBox))
+            page.draw(with: .cropBox, to: ctx)
+        }
         ctx.restoreGState()
     }
 
