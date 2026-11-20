@@ -215,6 +215,9 @@ struct TranslateViewImpl: View {
     @State private var choice: Choice = .enUS
     @State private var target = Locale.Language(identifier: "en-US")
     @State private var britishSpelling = false
+    /// How Malay is done on this iPhone.
+    @State private var malay: MalayRoute = .checking
+    enum MalayRoute: Equatable { case checking, apple(Locale.Language), ai, none }
     @State private var config: TranslationSession.Configuration?
     @State private var pageTexts: [String] = []
 
@@ -226,11 +229,13 @@ struct TranslateViewImpl: View {
                     SectionLabel("Translate to")
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
                         ForEach(Choice.allCases) { c in
-                            let ok = resolve(c) != nil
+                            let ok = available(c)
                             Button { choice = c } label: {
                                 VStack(spacing: 2) {
                                     Text(c.rawValue).font(.subheadline.weight(.semibold))
-                                    if let d = c.detail { Text(d).font(.caption2).foregroundStyle(.secondary) }
+                                    if c == .malay, case .ai = malay {
+                                        Text("Malaysia · AI translation").font(.caption2).foregroundStyle(.secondary)
+                                    } else if let d = c.detail { Text(d).font(.caption2).foregroundStyle(.secondary) }
                                 }
                                 .foregroundStyle(choice == c ? Color(hex: 0x72243E) : Theme.ink)
                                 .frame(maxWidth: .infinity).padding(.vertical, 10)
@@ -241,8 +246,13 @@ struct TranslateViewImpl: View {
                             .disabled(loaded && !ok)
                         }
                     }
-                    if loaded && resolve(.malay) == nil {
-                        Text("Update to iOS 27 to translate into Malay.").font(.caption).foregroundStyle(Theme.red)
+                    if loaded, malay == .none {
+                        Text("Malay needs Apple's translator or Apple Intelligence, and neither is available on this iPhone right now.")
+                            .font(.caption).foregroundStyle(Theme.red)
+                    }
+                    if choice == .malay, case .ai = malay {
+                        Text("iOS's translator doesn't offer Malay here, so Apple Intelligence translates it on your iPhone.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     if choice == .enGB && britishSpelling {
                         Text("Translated to English, then spelt the British way (colour, organise, centre).").font(.caption).foregroundStyle(.secondary)
@@ -252,12 +262,21 @@ struct TranslateViewImpl: View {
                 }
                 Button("Translate") { start() }
                     .buttonStyle(PrimaryButtonStyle(color: Tool.translate.color))
-                    .disabled(loaded && resolve(choice) == nil)
+                    .disabled(loaded && !available(choice))
             }
         }
         .preset(preset, into: $inputs)
         .task {
             supported = await LanguageAvailability().supportedLanguages
+            if let ms = supported.first(where: { $0.languageCode?.identifier == "ms" }) {
+                malay = .apple(ms)
+            } else {
+                // The list can leave out newer languages, so ask directly too.
+                let ms = Locale.Language(identifier: "ms")
+                let st = await LanguageAvailability().status(from: Locale.Language(identifier: "en"), to: ms)
+                if st != .unsupported { malay = .apple(ms) }
+                else { malay = AIEngine.unavailableReason == nil ? .ai : .none }
+            }
             loaded = true
             updateTarget()
         }
@@ -279,9 +298,14 @@ struct TranslateViewImpl: View {
         switch c {
         case .enUS: return find("en", region: "US") ?? find("en")
         case .enGB: return find("en", region: "GB") ?? find("en", region: "US") ?? find("en")
-        case .malay: return find("ms")
+        case .malay: if case .apple(let l) = malay { return l } else { return nil }
         case .chinese: return find("zh", script: "Hans") ?? find("zh", region: "CN") ?? find("zh")
         }
+    }
+
+    private func available(_ c: Choice) -> Bool {
+        if c == .malay { if case .ai = malay { return true } }
+        return resolve(c) != nil
     }
 
     private func updateTarget() {
@@ -299,11 +323,13 @@ struct TranslateViewImpl: View {
         state.busy = true
         state.text = "Reading the PDF"
         let rep = state.reporter
+        let useAI: Bool = { if choice == .malay, case .ai = malay { return true }; return false }()
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let doc = try PDFLoader.open(url)
                 let texts = OCR.documentText(doc, progress: rep)
                 DispatchQueue.main.async {
+                    if useAI { translateWithAI(texts, url: url, rep: rep); return }
                     pageTexts = texts
                     if config == nil {
                         config = TranslationSession.Configuration(source: nil, target: target)
@@ -315,6 +341,32 @@ struct TranslateViewImpl: View {
             } catch {
                 DispatchQueue.main.async { state.error = error.localizedDescription; state.busy = false }
             }
+        }
+    }
+
+    private func translateWithAI(_ texts: [String], url: URL, rep: ProgressReporter) {
+        Task { @MainActor in
+            do {
+                var sections: [(String, String)] = []
+                var all: [String] = []
+                for (i, text) in texts.enumerated() {
+                    let paras = paragraphs(text)
+                    guard !paras.isEmpty else { continue }
+                    let body = try await AIEngine.translate(paras.joined(separator: "\n\n"), into: "Malay (Bahasa Melayu as used in Malaysia)",
+                                                            progress: rep, label: "Translating page \(i + 1) of \(texts.count)")
+                    sections.append(("Halaman \(i + 1)", body))
+                    all.append(body)
+                }
+                guard !all.isEmpty else { throw KertasError("No text was found in this PDF.") }
+                let base = FileStore.baseName(url)
+                let pdf = PDFOps.textPDF(title: base + " (Bahasa Melayu)", sections: sections)
+                let out = try FileStore.save(pdf, base: base + " Malay", ext: "pdf")
+                let joined = all.joined(separator: "\n\n")
+                state.output = ToolOutput(urls: [out], text: String(joined.prefix(4000)) + (joined.count > 4000 ? "\n…" : ""), message: "Translated to Malay with Apple Intelligence")
+            } catch {
+                state.error = error.localizedDescription
+            }
+            state.busy = false
         }
     }
 

@@ -86,6 +86,27 @@ enum AIEngine {
     }
 }
 
+extension AIEngine {
+    /// Translates with Apple Intelligence, for languages iOS's translator doesn't offer.
+    static func translate(_ text: String, into language: String, progress: ProgressReporter, label: String) async throws -> String {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            if let reason = unavailableReason { throw KertasError(reason) }
+            var out: [String] = []
+            let parts = chunks(text, size: 2500)
+            for (i, part) in parts.enumerated() {
+                progress(nil, label + (parts.count > 1 ? " (part \(i + 1) of \(parts.count))" : ""))
+                let session = LanguageModelSession(instructions: "You are a professional translator. Translate everything the user gives you into \(language). Keep names, numbers, dates and line breaks. Reply with the translation only, no notes.")
+                let r = try await session.respond(to: part)
+                out.append(r.content.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            return out.joined(separator: "\n")
+        }
+        #endif
+        throw KertasError(unavailableReason ?? "AI translation isn't available.")
+    }
+}
+
 enum TextDiff {
     struct Result {
         var old: AttributedString

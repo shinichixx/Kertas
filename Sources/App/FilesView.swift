@@ -111,9 +111,21 @@ struct FileDetailView: View {
     let url: URL
     private let quickTools: [Tool] = [.edit, .sign, .compress, .ocr, .organize, .split, .pageNumbers, .watermark, .protect, .pdfToJpg, .summarize, .translate]
 
+    @State private var page = 1
+    @State private var pages = 1
+
     var body: some View {
-        PDFKitView(url: url)
-            .ignoresSafeArea(edges: .bottom)
+        FittedPDFView(url: url, page: $page, pages: $pages)
+            .background(Theme.page)
+            .overlay(alignment: .bottom) {
+                Text("\(page) / \(pages)")
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 5)
+                    .background(Theme.ink.opacity(0.85), in: Capsule())
+                    .padding(.bottom, 10)
+            }
+            .toolbar(.hidden, for: .tabBar)
             .navigationTitle(FileStore.baseName(url))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -128,5 +140,69 @@ struct FileDetailView: View {
                     } label: { Image(systemName: "wand.and.stars") }
                 }
             }
+    }
+}
+
+
+/// PDF viewer that fits each page on screen, centred, without the doubled top inset.
+struct FittedPDFView: UIViewRepresentable {
+    let url: URL
+    @Binding var page: Int
+    @Binding var pages: Int
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> FittingPDFView {
+        let v = FittingPDFView()
+        v.backgroundColor = UIColor(Theme.page)
+        v.displayDirection = .vertical
+        v.displaysPageBreaks = true
+        v.pageBreakMargins = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        let doc = PDFDocument(url: url)
+        v.displayMode = (doc?.pageCount ?? 1) > 1 ? .singlePageContinuous : .singlePage
+        v.document = doc
+        context.coordinator.observe(v)
+        DispatchQueue.main.async {
+            pages = max(doc?.pageCount ?? 1, 1)
+            page = 1
+        }
+        return v
+    }
+
+    func updateUIView(_ v: FittingPDFView, context: Context) {}
+
+    final class Coordinator: NSObject {
+        let parent: FittedPDFView
+        private var token: NSObjectProtocol?
+        init(_ p: FittedPDFView) { parent = p }
+
+        func observe(_ v: PDFView) {
+            token = NotificationCenter.default.addObserver(forName: .PDFViewPageChanged, object: v, queue: .main) { [weak self] _ in
+                guard let self, let doc = v.document, let current = v.currentPage else { return }
+                self.parent.page = doc.index(for: current) + 1
+            }
+        }
+
+        deinit { if let token { NotificationCenter.default.removeObserver(token) } }
+    }
+}
+
+final class FittingPDFView: PDFView {
+    private var lastSize: CGSize = .zero
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // PDFView's own scroll view adds the navigation bar height again; stop that.
+        for case let scroll as UIScrollView in subviews {
+            scroll.contentInsetAdjustmentBehavior = .never
+            scroll.contentInset = .zero
+        }
+        guard bounds.size != lastSize, bounds.width > 0, document != nil else { return }
+        lastSize = bounds.size
+        let fit = scaleFactorForSizeToFit
+        minScaleFactor = fit
+        maxScaleFactor = max(fit * 6, 4)
+        scaleFactor = fit
+        if let first = document?.page(at: 0), currentPage == nil || currentPage == first { go(to: first) }
     }
 }
