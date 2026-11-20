@@ -148,33 +148,96 @@ struct SummarizeView: View {
     @StateObject private var state = ToolState()
     @State private var inputs: [URL] = []
     @State private var style: SummaryStyle = .bullets
+    @State private var live = ""
+    @State private var running = false
+    @State private var stage = ""
+    @State private var fraction: Double?
+    @State private var job: Task<Void, Never>?
+    @State private var ready = false
 
     var body: some View {
         ToolPage(tool: .summarize, state: state) {
             if let reason = AIEngine.unavailableReason {
                 Text(reason).font(.footnote).padding(10).frame(maxWidth: .infinity, alignment: .leading).background(Theme.redSoft, in: RoundedRectangle(cornerRadius: 10))
+            } else {
+                Label(ready ? "AI ready" : "Getting the AI ready…", systemImage: ready ? "checkmark.circle.fill" : "hourglass")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(ready ? Color(hex: 0x3B6D11) : Theme.grey)
             }
-            InputPicker(urls: $inputs)
+            if !running { InputPicker(urls: $inputs) }
             if let url = inputs.first {
-                Picker("Style", selection: $style) { ForEach(SummaryStyle.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented)
-                Text("Runs privately on your iPhone. Long PDFs take a while.").font(.caption).foregroundStyle(.secondary)
-                Button("Summarise") {
-                    let st = style
-                    state.runMain("Reading the PDF") { rep in
-                        let doc = try PDFLoader.open(url)
-                        let pages = await Task.detached { OCR.documentText(doc, progress: rep) }.value
-                        let text = pages.joined(separator: "\n")
-                        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KertasError("No text was found in this PDF.") }
-                        let summary = try await AIEngine.summarize(text, style: st, progress: rep)
-                        let pdf = PDFOps.textPDF(title: "Summary of " + FileStore.baseName(url), sections: [("", summary)])
-                        let out = try FileStore.save(pdf, base: FileStore.baseName(url) + " summary", ext: "pdf")
-                        return ToolOutput(urls: [out], text: summary)
+                Picker("Style", selection: $style) { ForEach(SummaryStyle.allCases) { Text($0.rawValue).tag($0) } }
+                    .pickerStyle(.segmented)
+                    .disabled(running)
+                if running || !live.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label(stage, systemImage: "sparkles").font(.caption.weight(.medium)).foregroundStyle(Color(hex: 0x993556))
+                            Spacer()
+                            if running { Button("Stop") { job?.cancel() }.font(.caption.weight(.semibold)) }
+                        }
+                        if let f = fraction { ProgressView(value: f).tint(Tool.summarize.color) }
+                        else if running { ProgressView().progressViewStyle(.linear).tint(Tool.summarize.color) }
+                        if !live.isEmpty {
+                            Text(live).font(.callout).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
+                    .padding(12)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Tool.summarize.color, lineWidth: 1.5))
+                } else {
+                    Text("Runs privately on your iPhone. The summary appears as it's written.").font(.caption).foregroundStyle(.secondary)
+                    Button("Summarise") { start(url) }
+                        .buttonStyle(PrimaryButtonStyle(color: Tool.summarize.color))
+                        .disabled(AIEngine.unavailableReason != nil)
                 }
-                .buttonStyle(PrimaryButtonStyle(color: Tool.summarize.color))
             }
         }
         .preset(preset, into: $inputs)
+        .task {
+            await AIEngine.prewarm()
+            ready = AIEngine.unavailableReason == nil
+        }
+        .onDisappear { job?.cancel() }
+    }
+
+    private func start(_ url: URL) {
+        let st = style
+        running = true
+        live = ""
+        stage = "Reading the PDF"
+        fraction = nil
+        let rep = ProgressReporter { f, t in fraction = f; stage = t }
+        job = Task { @MainActor in
+            var summary = ""
+            do {
+                let doc = try PDFLoader.open(url)
+                let pages = await Task.detached { OCR.documentText(doc, progress: rep) }.value
+                let text = pages.joined(separator: "\n")
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KertasError("No text was found in this PDF.") }
+                summary = try await AIEngine.summarizeLive(text, style: st, progress: rep) { partial in
+                    live = partial
+                    stage = "Writing the summary…"
+                    fraction = nil
+                }
+            } catch is CancellationError {
+                summary = live
+            } catch {
+                if Task.isCancelled { summary = live } else {
+                    state.error = error.localizedDescription
+                    running = false
+                    return
+                }
+            }
+            running = false
+            guard !summary.isEmpty else { return }
+            let pdf = PDFOps.textPDF(title: "Summary of " + FileStore.baseName(url), sections: [("", summary)])
+            do {
+                let out = try FileStore.save(pdf, base: FileStore.baseName(url) + " summary", ext: "pdf")
+                state.output = ToolOutput(urls: [out], text: summary, message: Task.isCancelled ? "Stopped early, saved what was written" : nil)
+            } catch { state.error = error.localizedDescription }
+            live = ""
+        }
     }
 }
 
@@ -220,6 +283,9 @@ struct TranslateViewImpl: View {
     enum MalayRoute: Equatable { case checking, apple(Locale.Language), ai, none }
     @State private var config: TranslationSession.Configuration?
     @State private var pageTexts: [String] = []
+    @State private var keepDesign = true
+    @State private var blocks: [[TextBlock]] = []
+    @State private var layoutDoc: PDFDocument?
 
     var body: some View {
         ToolPage(tool: .translate, state: state) {
@@ -258,6 +324,17 @@ struct TranslateViewImpl: View {
                         Text("Translated to English, then spelt the British way (colour, organise, centre).").font(.caption).foregroundStyle(.secondary)
                     }
                     Text("The language of the PDF is detected for you. The first time, iOS may ask to download the language.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Card {
+                    SectionLabel("Output")
+                    Picker("Output", selection: $keepDesign) {
+                        Text("Keep original design").tag(true)
+                        Text("Plain text document").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    Text(keepDesign ? "Same layout, logo, fonts and colours, with the words translated in place."
+                                    : "A clean reading copy with the translated text only.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Button("Translate") { start() }
@@ -324,9 +401,21 @@ struct TranslateViewImpl: View {
         state.text = "Reading the PDF"
         let rep = state.reporter
         let useAI: Bool = { if choice == .malay, case .ai = malay { return true }; return false }()
+        let keepDesign = keepDesign
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let doc = try PDFLoader.open(url)
+                if keepDesign {
+                    let found = LayoutTranslator.extract(doc, progress: rep)
+                    guard found.contains(where: { $0.contains { $0.needsTranslation } }) else { throw KertasError("No text was found in this PDF.") }
+                    DispatchQueue.main.async {
+                        blocks = found
+                        layoutDoc = doc
+                        if useAI { translateLayoutWithAI(url: url, rep: rep); return }
+                        triggerSession()
+                    }
+                    return
+                }
                 let texts = OCR.documentText(doc, progress: rep)
                 DispatchQueue.main.async {
                     if useAI { translateWithAI(texts, url: url, rep: rep); return }
@@ -340,6 +429,105 @@ struct TranslateViewImpl: View {
                 }
             } catch {
                 DispatchQueue.main.async { state.error = error.localizedDescription; state.busy = false }
+            }
+        }
+    }
+
+    private func triggerSession() {
+        if config == nil {
+            config = TranslationSession.Configuration(source: nil, target: target)
+        } else {
+            config?.target = target
+            config?.invalidate()
+        }
+    }
+
+    /// Indexes of blocks that need translating, page by page.
+    private var pending: [(Int, Int)] {
+        blocks.indices.flatMap { p in blocks[p].indices.filter { blocks[p][$0].needsTranslation }.map { (p, $0) } }
+    }
+
+    @MainActor
+    private func translateLayout(_ session: TranslationSession) async {
+        guard let url = inputs.first else { return }
+        do {
+            let todo = pending
+            var done = 0
+            for start in stride(from: 0, to: todo.count, by: 40) {
+                let slice = Array(todo[start..<min(start + 40, todo.count)])
+                state.fraction = Double(done) / Double(max(todo.count, 1))
+                state.text = "Translating \(done + 1)–\(done + slice.count) of \(todo.count) text blocks"
+                let requests = slice.map { TranslationSession.Request(sourceText: blocks[$0.0][$0.1].text, clientIdentifier: "\($0.0)-\($0.1)") }
+                let responses = try await session.translations(from: requests)
+                for r in responses {
+                    guard let id = r.clientIdentifier else { continue }
+                    let parts = id.split(separator: "-").compactMap { Int($0) }
+                    guard parts.count == 2 else { continue }
+                    blocks[parts[0]][parts[1]].translated = britishSpelling ? BritishSpelling.convert(r.targetText) : r.targetText
+                }
+                done += slice.count
+            }
+            finishLayout(url: url, languageName: choice.rawValue)
+        } catch {
+            state.error = error.localizedDescription
+            state.busy = false
+        }
+    }
+
+    private func translateLayoutWithAI(url: URL, rep: ProgressReporter) {
+        Task { @MainActor in
+            do {
+                for p in blocks.indices {
+                    let idx = blocks[p].indices.filter { blocks[p][$0].needsTranslation }
+                    guard !idx.isEmpty else { continue }
+                    // Numbered list so one request covers the whole page.
+                    let list = idx.enumerated().map { "\($0.offset + 1). \(blocks[p][$0.element].text)" }.joined(separator: "\n")
+                    let reply = try await AIEngine.translate(list, into: "Malay (Bahasa Melayu as used in Malaysia). Keep the same numbering, one numbered item per line",
+                                                             progress: rep, label: "Translating page \(p + 1) of \(blocks.count)")
+                    var map: [Int: String] = [:]
+                    for line in reply.components(separatedBy: "\n") {
+                        let t = line.trimmingCharacters(in: .whitespaces)
+                        guard let dot = t.firstIndex(of: "."), let n = Int(t[t.startIndex..<dot]) else { continue }
+                        map[n] = String(t[t.index(after: dot)...]).trimmingCharacters(in: .whitespaces)
+                    }
+                    for (k, i) in idx.enumerated() {
+                        if let m = map[k + 1], !m.isEmpty {
+                            blocks[p][i].translated = m
+                        } else {
+                            blocks[p][i].translated = try await AIEngine.translate(blocks[p][i].text, into: "Malay (Bahasa Melayu as used in Malaysia)",
+                                                                                   progress: rep, label: "Translating page \(p + 1) of \(blocks.count)")
+                        }
+                    }
+                }
+                finishLayout(url: url, languageName: "Malay")
+            } catch {
+                state.error = error.localizedDescription
+                state.busy = false
+            }
+        }
+    }
+
+    @MainActor
+    private func finishLayout(url: URL, languageName: String) {
+        guard let doc = layoutDoc else { state.busy = false; return }
+        let all = blocks
+        let rep = state.reporter
+        state.fraction = nil
+        state.text = "Laying out the translation"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = LayoutTranslator.render(doc, blocks: all, progress: rep)
+            let joined = all.flatMap { $0 }.compactMap(\.translated).joined(separator: "\n")
+            DispatchQueue.main.async {
+                do {
+                    let out = try FileStore.save(data, base: FileStore.baseName(url) + " " + languageName, ext: "pdf")
+                    state.output = ToolOutput(urls: [out], text: String(joined.prefix(3000)) + (joined.count > 3000 ? "\n…" : ""),
+                                              message: "Translated to \(languageName), original design kept")
+                } catch {
+                    state.error = error.localizedDescription
+                }
+                state.busy = false
+                blocks = []
+                layoutDoc = nil
             }
         }
     }
@@ -386,6 +574,7 @@ struct TranslateViewImpl: View {
 
     @MainActor
     private func translate(_ session: TranslationSession) async {
+        if !blocks.isEmpty { await translateLayout(session); return }
         guard !pageTexts.isEmpty, let url = inputs.first else { return }
         do {
             var sections: [(String, String)] = []

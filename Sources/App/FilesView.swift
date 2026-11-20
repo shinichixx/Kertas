@@ -115,16 +115,17 @@ struct FileDetailView: View {
     @State private var pages = 1
 
     var body: some View {
-        FittedPDFView(url: url, page: $page, pages: $pages)
+        VStack(spacing: 0) {
+            // The page is centred in this area, which ends where the counter strip begins.
+            FittedPDFView(url: url, page: $page, pages: $pages)
+            Text("\(page) / \(pages)")
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12).padding(.vertical, 5)
+                .background(Theme.ink.opacity(0.85), in: Capsule())
+                .padding(.vertical, 10)
+        }
             .background(Theme.page)
-            .overlay(alignment: .bottom) {
-                Text("\(page) / \(pages)")
-                    .font(.caption.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12).padding(.vertical, 5)
-                    .background(Theme.ink.opacity(0.85), in: Capsule())
-                    .padding(.bottom, 10)
-            }
             .toolbar(.hidden, for: .tabBar)
             .navigationTitle(FileStore.baseName(url))
             .navigationBarTitleDisplayMode(.inline)

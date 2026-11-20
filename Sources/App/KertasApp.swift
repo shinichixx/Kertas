@@ -20,7 +20,13 @@ struct KertasApp: App {
                         router.open(searchID: id)
                     }
                 }
-                .task { SpotlightIndex.indexTools() }
+                .task {
+                    SpotlightIndex.indexTools()
+                    KertasShortcuts.updateAppShortcutParameters()
+                }
+                .onContinueUserActivity(ToolActivity.type) { activity in
+                    if let raw = activity.userInfo?["tool"] as? String, let t = Tool(rawValue: raw) { router.open(t) }
+                }
                 .onOpenURL { url in
                     if let adopted = FileStore.adopt(url) {
                         router.tab = .files
@@ -66,7 +72,7 @@ struct RootView: View {
             NavigationStack(path: $router.toolPath) { HomeView() }
                 .tabItem { Label("Tools", systemImage: "square.grid.2x2") }
                 .tag(AppRouter.Tab.tools)
-            NavigationStack { ScanView() }
+            NavigationStack { ScanView().modifier(ToolActivity(tool: .scan)) }
                 .tabItem { Label("Scan", systemImage: "doc.viewfinder") }
                 .tag(AppRouter.Tab.scan)
             FilesTab()
@@ -163,6 +169,10 @@ struct ToolRouter: View {
     var preset: URL? = nil
 
     var body: some View {
+        content.modifier(ToolActivity(tool: tool))
+    }
+
+    @ViewBuilder private var content: some View {
         switch tool {
         case .scan: ScanView()
         case .merge: MergeView()

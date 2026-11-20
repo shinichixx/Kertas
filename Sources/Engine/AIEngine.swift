@@ -87,6 +87,51 @@ enum AIEngine {
 }
 
 extension AIEngine {
+    /// Loads the model into memory ahead of use, so the first answer starts sooner.
+    static func prewarm() async {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *), unavailableReason == nil {
+            LanguageModelSession(instructions: "You summarise documents accurately.").prewarm()
+        }
+        #endif
+    }
+
+    /// Like `summarize`, but streams the final summary as it's written.
+    @MainActor
+    static func summarizeLive(_ text: String, style: SummaryStyle, progress: ProgressReporter, onPartial: @escaping @MainActor (String) -> Void) async throws -> String {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            if let reason = unavailableReason { throw KertasError(reason) }
+            let instructions = "You summarise documents accurately. Only use facts found in the text. Reply in the same language as the document."
+            var parts = chunks(text)
+            guard !parts.isEmpty else { throw KertasError("There's no text to summarise.") }
+            var round = 0
+            while parts.count > 1 {
+                round += 1
+                var notes: [String] = []
+                for (i, part) in parts.enumerated() {
+                    try Task.checkCancellation()
+                    progress(Double(i) / Double(parts.count), "Reading part \(i + 1) of \(parts.count)" + (round > 1 ? " (round \(round))" : ""))
+                    let session = LanguageModelSession(instructions: instructions)
+                    let r = try await session.respond(to: "Write concise notes covering every important point in this part of a document. Keep numbers, dates and names.\n\n" + part)
+                    notes.append(r.content)
+                }
+                parts = chunks(notes.joined(separator: "\n"))
+            }
+            try Task.checkCancellation()
+            let session = LanguageModelSession(instructions: instructions)
+            var latest = ""
+            for try await snap in session.streamResponse(to: style.ask + "\n\nDocument:\n" + parts[0]) {
+                latest = snap.content
+                onPartial(latest)
+                if Task.isCancelled { break }
+            }
+            return latest
+        }
+        #endif
+        throw KertasError(unavailableReason ?? "The summariser isn't available.")
+    }
+
     /// Translates with Apple Intelligence, for languages iOS's translator doesn't offer.
     static func translate(_ text: String, into language: String, progress: ProgressReporter, label: String) async throws -> String {
         #if canImport(FoundationModels)
