@@ -1,8 +1,9 @@
 import SwiftUI
+import CoreSpotlight
 
 @main
 struct KertasApp: App {
-    @StateObject private var router = AppRouter()
+    @ObservedObject private var router = AppRouter.shared
 
     init() {
         FontLibrary.shared.registerInstalledFonts()
@@ -14,6 +15,12 @@ struct KertasApp: App {
                 .environmentObject(router)
                 .tint(Theme.red)
                 .preferredColorScheme(.light)
+                .onContinueUserActivity(CSSearchableItemActionType) { activity in
+                    if let id = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String {
+                        router.open(searchID: id)
+                    }
+                }
+                .task { SpotlightIndex.indexTools() }
                 .onOpenURL { url in
                     if let adopted = FileStore.adopt(url) {
                         router.tab = .files
@@ -25,9 +32,30 @@ struct KertasApp: App {
 }
 
 final class AppRouter: ObservableObject {
+    static let shared = AppRouter()
     enum Tab: Hashable { case tools, scan, files }
+    enum ScanStart { case camera, photos }
     @Published var tab: Tab = .tools
     @Published var openedFile: URL?
+    /// A tool to open from Spotlight, Siri or Shortcuts.
+    @Published var toolPath: [Tool] = []
+    @Published var scanStart: ScanStart?
+
+    func open(_ tool: Tool) {
+        if tool == .scan { start(scan: .camera); return }
+        tab = .tools
+        toolPath = [tool]
+    }
+
+    func start(scan: ScanStart) {
+        tab = .scan
+        scanStart = scan
+    }
+
+    func open(searchID: String) {
+        if searchID == "tool.scanPhoto" { start(scan: .photos); return }
+        if searchID.hasPrefix("tool."), let t = Tool(rawValue: String(searchID.dropFirst(5))) { open(t) }
+    }
 }
 
 struct RootView: View {
@@ -35,7 +63,7 @@ struct RootView: View {
 
     var body: some View {
         TabView(selection: $router.tab) {
-            NavigationStack { HomeView() }
+            NavigationStack(path: $router.toolPath) { HomeView() }
                 .tabItem { Label("Tools", systemImage: "square.grid.2x2") }
                 .tag(AppRouter.Tab.tools)
             NavigationStack { ScanView() }
@@ -64,7 +92,7 @@ struct HomeView: View {
                     .scaledToFit()
                     .frame(height: 70)
                     .accessibilityLabel("Kertas")
-                    .padding(.top, 4)
+                    .padding(.top, -6)
 
                 Button { router.tab = .scan } label: {
                     HStack(spacing: 12) {
@@ -109,10 +137,12 @@ struct HomeView: View {
                     }
                 }
             }
-            .padding()
+            .padding(.horizontal)
+            .padding(.bottom)
         }
         .background(Theme.page)
         .navigationTitle("Tools")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .navigationBar)
         .navigationDestination(for: Tool.self) { ToolRouter(tool: $0) }
     }

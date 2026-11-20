@@ -199,10 +199,22 @@ struct TranslateView: View {
 @available(iOS 18.0, *)
 struct TranslateViewImpl: View {
     var preset: URL?
+
+    enum Choice: String, CaseIterable, Identifiable {
+        case enUS = "English (US)", enGB = "English (UK)", malay = "Malay", chinese = "Chinese"
+        var id: String { rawValue }
+        var detail: String? {
+            switch self { case .malay: return "Malaysia"; case .chinese: return "Mandarin"; default: return nil }
+        }
+    }
+
     @StateObject private var state = ToolState()
     @State private var inputs: [URL] = []
-    @State private var languages: [Locale.Language] = []
-    @State private var target = Locale.Language(identifier: "en")
+    @State private var supported: [Locale.Language] = []
+    @State private var loaded = false
+    @State private var choice: Choice = .enUS
+    @State private var target = Locale.Language(identifier: "en-US")
+    @State private var britishSpelling = false
     @State private var config: TranslationSession.Configuration?
     @State private var pageTexts: [String] = []
 
@@ -211,30 +223,75 @@ struct TranslateViewImpl: View {
             InputPicker(urls: $inputs)
             if inputs.first != nil {
                 Card {
-                    OptionRow(title: "Translate to") {
-                        Picker("", selection: $target) {
-                            ForEach(languages, id: \.self) { Text(name($0)).tag($0) }
+                    SectionLabel("Translate to")
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                        ForEach(Choice.allCases) { c in
+                            let ok = resolve(c) != nil
+                            Button { choice = c } label: {
+                                VStack(spacing: 2) {
+                                    Text(c.rawValue).font(.subheadline.weight(.semibold))
+                                    if let d = c.detail { Text(d).font(.caption2).foregroundStyle(.secondary) }
+                                }
+                                .foregroundStyle(choice == c ? Color(hex: 0x72243E) : Theme.ink)
+                                .frame(maxWidth: .infinity).padding(.vertical, 10)
+                                .background(choice == c ? Color(hex: 0xFBEAF0) : Color.white, in: RoundedRectangle(cornerRadius: 10))
+                                .overlay(RoundedRectangle(cornerRadius: 10).stroke(choice == c ? Tool.translate.color : Theme.line, lineWidth: choice == c ? 1.5 : 0.5))
+                                .opacity(ok || !loaded ? 1 : 0.45)
+                            }
+                            .disabled(loaded && !ok)
                         }
+                    }
+                    if loaded && resolve(.malay) == nil {
+                        Text("Update to iOS 27 to translate into Malay.").font(.caption).foregroundStyle(Theme.red)
+                    }
+                    if choice == .enGB && britishSpelling {
+                        Text("Translated to English, then spelt the British way (colour, organise, centre).").font(.caption).foregroundStyle(.secondary)
                     }
                     Text("The language of the PDF is detected for you. The first time, iOS may ask to download the language.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Button("Translate") { start() }.buttonStyle(PrimaryButtonStyle(color: Tool.translate.color))
+                Button("Translate") { start() }
+                    .buttonStyle(PrimaryButtonStyle(color: Tool.translate.color))
+                    .disabled(loaded && resolve(choice) == nil)
             }
         }
         .preset(preset, into: $inputs)
         .task {
-            let langs = await LanguageAvailability().supportedLanguages
-            languages = langs.sorted { name($0) < name($1) }
-            if let en = languages.first(where: { $0.languageCode?.identifier == "en" }) { target = en }
+            supported = await LanguageAvailability().supportedLanguages
+            loaded = true
+            updateTarget()
         }
+        .onChange(of: choice) { _, _ in updateTarget() }
         .translationTask(config) { session in
             await translate(session)
         }
     }
 
+    /// The language iOS can actually translate into for each choice.
+    private func resolve(_ c: Choice) -> Locale.Language? {
+        func find(_ code: String, region: String? = nil, script: String? = nil) -> Locale.Language? {
+            supported.first {
+                $0.languageCode?.identifier == code
+                    && (region == nil || $0.region?.identifier == region)
+                    && (script == nil || $0.script?.identifier == script)
+            }
+        }
+        switch c {
+        case .enUS: return find("en", region: "US") ?? find("en")
+        case .enGB: return find("en", region: "GB") ?? find("en", region: "US") ?? find("en")
+        case .malay: return find("ms")
+        case .chinese: return find("zh", script: "Hans") ?? find("zh", region: "CN") ?? find("zh")
+        }
+    }
+
+    private func updateTarget() {
+        guard let lang = resolve(choice) else { return }
+        target = lang
+        britishSpelling = choice == .enGB && lang.region?.identifier != "GB"
+    }
+
     private func name(_ l: Locale.Language) -> String {
-        Locale.current.localizedString(forIdentifier: l.minimalIdentifier) ?? l.minimalIdentifier
+        choice.rawValue
     }
 
     private func start() {
@@ -289,7 +346,8 @@ struct TranslateViewImpl: View {
                 let requests = paras.enumerated().map { TranslationSession.Request(sourceText: $0.element, clientIdentifier: "\($0.offset)") }
                 let responses = try await session.translations(from: requests)
                 let ordered = responses.sorted { Int($0.clientIdentifier ?? "0") ?? 0 < Int($1.clientIdentifier ?? "0") ?? 0 }
-                let body = ordered.map(\.targetText).joined(separator: "\n\n")
+                var body = ordered.map(\.targetText).joined(separator: "\n\n")
+                if britishSpelling { body = BritishSpelling.convert(body) }
                 sections.append(("Page \(i + 1)", body))
                 all.append(body)
             }

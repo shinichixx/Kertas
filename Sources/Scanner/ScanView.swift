@@ -65,7 +65,9 @@ final class ScanSession: ObservableObject {
 struct ScanView: View {
     @StateObject private var session = ScanSession()
     @StateObject private var state = ToolState()
+    @ObservedObject private var router = AppRouter.shared
     @State private var showCamera = false
+    @State private var showPhotos = false
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var selected: UUID?
     @State private var adjusting: ScanPage?
@@ -74,23 +76,44 @@ struct ScanView: View {
     @State private var pageSize: ScanPageSize = .original
     @State private var fit: ScanFit = .fit
     @State private var name = ""
+    @State private var renaming = false
+    @State private var draftName = ""
+    @State private var confirmClear = false
     @State private var showResult = false
 
     private var current: ScanPage? {
         session.pages.first { $0.id == selected } ?? session.pages.last
     }
 
+    private var editing: Bool { !session.pages.isEmpty || session.detecting > 0 }
+
     var body: some View {
         Group {
-            if session.pages.isEmpty && session.detecting == 0 {
-                emptyState
-            } else {
-                editor
-            }
+            if editing { editor } else { emptyState }
         }
         .background(Theme.page)
-        .navigationTitle("Scan to PDF")
+        .navigationTitle(editing ? "Scan · \(session.pages.count) page\(session.pages.count == 1 ? "" : "s")" : "Scan to PDF")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(editing ? .hidden : .visible, for: .tabBar)
+        .toolbar {
+            if editing {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Clear") { confirmClear = true }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { draftName = name; renaming = true } label: { Image(systemName: "pencil") }
+                        .accessibilityLabel("Rename")
+                }
+            }
+        }
+        .confirmationDialog("Clear this scan?", isPresented: $confirmClear, titleVisibility: .visible) {
+            Button("Clear all pages", role: .destructive) { session.pages.removeAll(); name = ""; selected = nil }
+        } message: { Text("The pages you scanned will be removed.") }
+        .alert("File name", isPresented: $renaming) {
+            TextField(defaultName, text: $draftName)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") { name = draftName.trimmingCharacters(in: .whitespaces) }
+        }
         .fullScreenCover(isPresented: $showCamera) {
             DocumentCameraView(onFinish: { imgs in
                 showCamera = false
@@ -98,6 +121,7 @@ struct ScanView: View {
             }, onCancel: { showCamera = false })
             .ignoresSafeArea()
         }
+        .photosPicker(isPresented: $showPhotos, selection: $photoItems, maxSelectionCount: 30, matching: .images)
         .onChange(of: photoItems) { _, items in
             guard !items.isEmpty else { return }
             Task {
@@ -111,6 +135,8 @@ struct ScanView: View {
                 }
             }
         }
+        .onChange(of: router.scanStart) { _, start in handleStart(start) }
+        .onAppear { handleStart(router.scanStart) }
         .sheet(item: $adjusting) { page in
             CornerAdjustView(image: page.original, quad: page.quad ?? Perspective.detect(page.original) ?? .inset) { q in
                 session.update(page.id) { $0.quad = q }
@@ -134,6 +160,15 @@ struct ScanView: View {
         } message: { Text(state.error ?? "") }
     }
 
+    private func handleStart(_ start: AppRouter.ScanStart?) {
+        guard let start else { return }
+        router.scanStart = nil
+        switch start {
+        case .camera: if VNDocumentCameraViewController.isSupported { showCamera = true }
+        case .photos: showPhotos = true
+        }
+    }
+
     private var emptyState: some View {
         VStack(spacing: 18) {
             Spacer()
@@ -146,10 +181,8 @@ struct ScanView: View {
                 Button { showCamera = true } label: { Label("Use camera", systemImage: "camera") }
                     .buttonStyle(PrimaryButtonStyle())
                     .disabled(!VNDocumentCameraViewController.isSupported)
-                PhotosPicker(selection: $photoItems, maxSelectionCount: 30, matching: .images) {
-                    Label("Choose photos", systemImage: "photo.on.rectangle")
-                }
-                .buttonStyle(SecondaryButtonStyle())
+                Button { showPhotos = true } label: { Label("Choose photos", systemImage: "photo.on.rectangle") }
+                    .buttonStyle(SecondaryButtonStyle())
             }
             .padding(.horizontal, 30)
             Spacer()
@@ -157,154 +190,161 @@ struct ScanView: View {
     }
 
     private var straightenNote: some View {
-        Label("Text is straightened automatically after you tap Save in the camera.", systemImage: "sparkles")
-            .font(.footnote)
+        Label("Text is straightened automatically on Save", systemImage: "sparkles")
+            .font(.caption)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
             .foregroundStyle(Color(hex: 0x791F1F))
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.redSoft, in: RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .frame(maxWidth: .infinity)
+            .background(Theme.redSoft, in: RoundedRectangle(cornerRadius: 8))
     }
 
+    // MARK: Editor (fits one screen)
+
     private var editor: some View {
-        VStack(spacing: 0) {
-            straightenNote.padding(.horizontal).padding(.top, 8)
+        VStack(spacing: 10) {
+            straightenNote
+
             ZStack {
-                if let p = current {
-                    if let r = p.result {
-                        Image(uiImage: r).resizable().scaledToFit()
-                            .background(Color.white)
-                            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
-                    } else {
-                        ProgressView().tint(Theme.red)
-                    }
+                if let p = current, let r = p.result {
+                    Image(uiImage: r).resizable().scaledToFit()
+                        .background(Color.white)
+                        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
                 } else {
-                    ProgressView("Finding page edges").tint(Theme.red)
+                    ProgressView(current == nil ? "Finding page edges" : "").tint(Theme.red)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(16)
 
-            if let p = current {
+            if let p = current { filterRow(p) }
+
+            HStack(spacing: 8) {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(ScanFilter.allCases) { f in
-                            Button { session.update(p.id) { $0.filter = f } } label: {
-                                Text(f.rawValue).font(.footnote.weight(.medium))
-                                    .padding(.horizontal, 12).padding(.vertical, 6)
-                                    .foregroundStyle(p.filter == f ? .white : Theme.ink)
-                                    .background(p.filter == f ? Theme.red : Theme.chip, in: Capsule())
+                    HStack(spacing: 6) {
+                        ForEach(Array(session.pages.enumerated()), id: \.element.id) { i, page in
+                            Button { selected = page.id } label: {
+                                Image(uiImage: page.result ?? page.original).resizable().scaledToFill()
+                                    .frame(width: 32, height: 42).clipped()
+                                    .overlay(RoundedRectangle(cornerRadius: 3).stroke(page.id == current?.id ? Theme.red : Theme.line, lineWidth: page.id == current?.id ? 2 : 0.5))
+                            }
+                            .contextMenu {
+                                if i > 0 { Button("Move left") { session.pages.swapAt(i, i - 1) } }
+                                if i < session.pages.count - 1 { Button("Move right") { session.pages.swapAt(i, i + 1) } }
                             }
                         }
-                        Button { session.update(p.id) { $0.straighten.toggle() } } label: {
-                            Label("Straighten text", systemImage: p.straighten ? "checkmark.circle.fill" : "circle")
-                                .font(.footnote.weight(.medium))
-                                .padding(.horizontal, 12).padding(.vertical, 6)
-                                .foregroundStyle(p.straighten ? Theme.red : Theme.ink)
-                                .background(p.straighten ? Theme.redSoft : Theme.chip, in: Capsule())
+                        if session.detecting > 0 { ProgressView().frame(width: 32, height: 42) }
+                        Menu {
+                            Button { showCamera = true } label: { Label("Camera", systemImage: "camera") }
+                            Button { showPhotos = true } label: { Label("Photos", systemImage: "photo.on.rectangle") }
+                        } label: {
+                            RoundedRectangle(cornerRadius: 3)
+                                .stroke(Theme.grey.opacity(0.6), style: StrokeStyle(lineWidth: 1, dash: [3]))
+                                .frame(width: 32, height: 42)
+                                .overlay(Image(systemName: "plus").foregroundStyle(Theme.grey))
                         }
-                        Button("Use on all") {
-                            for page in session.pages where page.id != p.id {
-                                session.update(page.id) { $0.filter = p.filter; $0.straighten = p.straighten }
-                            }
-                        }
-                        .font(.footnote)
+                        .accessibilityLabel("Add page")
                     }
-                    .padding(.horizontal)
+                    .padding(.vertical, 2)
                 }
-
-                HStack(spacing: 0) {
-                    toolButton("Corners", "crop") { adjusting = p }
-                    toolButton("Rotate", "rotate.right") { session.update(p.id) { $0.turns += 1 } }
-                    PhotosPicker(selection: $photoItems, maxSelectionCount: 30, matching: .images) {
-                        VStack(spacing: 4) { Image(systemName: "photo.badge.plus").font(.system(size: 19)); Text("Photo").font(.caption2) }
-                            .frame(maxWidth: .infinity).foregroundStyle(Theme.ink)
-                    }
-                    toolButton("Camera", "camera") { showCamera = true }
-                    toolButton("Delete", "trash") {
+                if let p = current {
+                    iconButton("crop", "Corners") { adjusting = p }
+                    iconButton("rotate.right", "Rotate") { session.update(p.id) { $0.turns += 1 } }
+                    iconButton("trash", "Delete page", tint: Theme.red) {
                         session.pages.removeAll { $0.id == p.id }
                         selected = session.pages.last?.id
                     }
                 }
-                .padding(.vertical, 10)
             }
+            .frame(height: 48)
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(Array(session.pages.enumerated()), id: \.element.id) { i, page in
-                        Button { selected = page.id } label: {
-                            ZStack(alignment: .bottomTrailing) {
-                                Image(uiImage: page.result ?? page.original).resizable().scaledToFill()
-                                    .frame(width: 48, height: 64).clipped()
-                                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(page.id == current?.id ? Theme.red : Theme.line, lineWidth: page.id == current?.id ? 2 : 0.5))
-                                Text("\(i + 1)").font(.caption2.bold()).foregroundStyle(.white).padding(3).background(Theme.ink.opacity(0.7), in: RoundedRectangle(cornerRadius: 3))
-                            }
-                        }
-                        .contextMenu {
-                            if i > 0 { Button("Move left") { session.pages.swapAt(i, i - 1) } }
-                            if i < session.pages.count - 1 { Button("Move right") { session.pages.swapAt(i, i + 1) } }
-                        }
-                    }
-                    if session.detecting > 0 { ProgressView().frame(width: 48, height: 64) }
-                }
-                .padding(.horizontal)
-            }
-            .frame(height: 72)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    TextField("File name", text: $name, prompt: Text(defaultName))
-                        .textFieldStyle(.roundedBorder)
-                    SectionLabel("Save as")
-                    Picker("Save as", selection: $format) {
-                        ForEach(ScanFormat.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    SectionLabel("Page size")
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(ScanPageSize.allCases) { s in
-                                Button { pageSize = s } label: {
-                                    Text(s.rawValue).font(.footnote.weight(.medium))
-                                        .padding(.horizontal, 12).padding(.vertical, 6)
-                                        .foregroundStyle(pageSize == s ? .white : Theme.ink)
-                                        .background(pageSize == s ? Theme.red : Theme.chip, in: Capsule())
-                                }
-                            }
-                        }
-                    }
+            HStack(spacing: 8) {
+                Menu {
+                    Picker("Save as", selection: $format) { ForEach(ScanFormat.allCases) { Text($0.rawValue).tag($0) } }
+                } label: { menuBox("Save as", format.rawValue) }
+                Menu {
+                    Picker("Page size", selection: $pageSize) { ForEach(ScanPageSize.allCases) { Text($0.rawValue).tag($0) } }
                     if pageSize != .original {
-                        SectionLabel("Fit")
-                        HStack(spacing: 8) {
-                            ForEach(ScanFit.allCases) { f in
-                                Button { fit = f } label: {
-                                    VStack(spacing: 2) {
-                                        Text(f.rawValue).font(.footnote.weight(.semibold))
-                                        Text(f.note).font(.caption2).foregroundStyle(.secondary)
-                                    }
-                                    .foregroundStyle(Theme.ink)
-                                    .frame(maxWidth: .infinity).padding(.vertical, 8)
-                                    .background(Color.white, in: RoundedRectangle(cornerRadius: 10))
-                                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(fit == f ? Theme.red : Theme.line, lineWidth: fit == f ? 1.5 : 0.5))
-                                }
+                        Section("Fit") {
+                            Picker("Fit", selection: $fit) {
+                                ForEach(ScanFit.allCases) { f in Text("\(f.rawValue) (\(f.note))").tag(f) }
                             }
                         }
                     }
-                    if format == .pdf {
-                        Toggle("Searchable text", isOn: $searchable).font(.footnote)
-                    } else if session.pages.count > 1 {
-                        Text("One image per page, all saved in one folder.").font(.caption).foregroundStyle(.secondary)
+                } label: { menuBox("Size", pageSize == .original ? "Original" : "\(pageSize.rawValue) · \(fit == .fit ? "Fit" : (fit == .fill ? "Fill" : "Stretch"))") }
+                Menu {
+                    Picker("Text", selection: $searchable) {
+                        Text("Searchable").tag(true)
+                        Text("Image only").tag(false)
                     }
-                    Button { save() } label: {
-                        Label("Save \(format.rawValue) (\(session.pages.count) page\(session.pages.count == 1 ? "" : "s"))", systemImage: "square.and.arrow.down")
-                    }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(session.pages.isEmpty || session.pages.contains { $0.result == nil })
-                }
-                .padding()
+                } label: { menuBox("Text", format == .pdf ? (searchable ? "Searchable" : "Image only") : "n/a") }
+                .disabled(format != .pdf)
             }
-            .frame(maxHeight: 300)
-            .background(Color.white)
+
+            Button { save() } label: {
+                Label("Save \(format.rawValue)\(session.pages.count > 1 ? " (\(session.pages.count) pages)" : "")", systemImage: "square.and.arrow.down")
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(session.pages.isEmpty || session.pages.contains { $0.result == nil })
         }
+        .padding(.horizontal)
+        .padding(.bottom, 8)
+        .padding(.top, 4)
+    }
+
+    private func filterRow(_ p: ScanPage) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(ScanFilter.allCases) { f in
+                    Button { session.update(p.id) { $0.filter = f } } label: {
+                        Text(f.rawValue).font(.footnote.weight(.medium))
+                            .padding(.horizontal, 11).padding(.vertical, 6)
+                            .foregroundStyle(p.filter == f ? .white : Theme.ink)
+                            .background(p.filter == f ? Theme.red : Theme.chip, in: Capsule())
+                    }
+                }
+                Button { session.update(p.id) { $0.straighten.toggle() } } label: {
+                    Label("Straighten", systemImage: p.straighten ? "checkmark.circle.fill" : "circle")
+                        .font(.footnote.weight(.medium))
+                        .padding(.horizontal, 11).padding(.vertical, 6)
+                        .foregroundStyle(p.straighten ? Theme.red : Theme.ink)
+                        .background(p.straighten ? Theme.redSoft : Theme.chip, in: Capsule())
+                }
+                if session.pages.count > 1 {
+                    Button("Use on all") {
+                        for page in session.pages where page.id != p.id {
+                            session.update(page.id) { $0.filter = p.filter; $0.straighten = p.straighten }
+                        }
+                    }
+                    .font(.footnote)
+                }
+            }
+        }
+    }
+
+    private func iconButton(_ icon: String, _ label: String, tint: Color = Theme.ink, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon).font(.system(size: 18)).foregroundStyle(tint)
+                .frame(width: 40, height: 40)
+                .background(Color.white, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.line, lineWidth: 0.5))
+        }
+        .accessibilityLabel(label)
+    }
+
+    private func menuBox(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            HStack(spacing: 3) {
+                Text(value).font(.footnote.weight(.semibold)).foregroundStyle(Theme.ink).lineLimit(1).minimumScaleFactor(0.7)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.line, lineWidth: 0.5))
     }
 
     private var defaultName: String {
@@ -312,16 +352,8 @@ struct ScanView: View {
         return "Scan " + f.string(from: Date())
     }
 
-    private func toolButton(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 4) { Image(systemName: icon).font(.system(size: 19)); Text(title).font(.caption2) }
-                .frame(maxWidth: .infinity)
-                .foregroundStyle(Theme.ink)
-        }
-    }
-
     private func save() {
-        let fileName = name.trimmingCharacters(in: .whitespaces).isEmpty ? defaultName : name
+        let fileName = name.isEmpty ? defaultName : name
         let ocr = searchable, size = pageSize, fit = fit, format = format
         let images = session.pages.map { $0.result ?? $0.original }
         state.run("Saving your \(format.rawValue)") { rep in
