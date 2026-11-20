@@ -49,6 +49,7 @@ enum LayoutTranslator {
         var bold: Bool
         var italic: Bool
         var color: UIColor
+        var sizeFromPDF = false
     }
 
     static func extract(_ doc: PDFDocument, progress: ProgressReporter?) -> [[TextBlock]] {
@@ -99,7 +100,7 @@ enum LayoutTranslator {
                 guard !group.isEmpty else { return }
                 let rect = group.dropFirst().reduce(group[0].rect) { $0.union($1.rect) }
                 let ocrText = group.map(\.text).joined(separator: " ")
-                out.append(styled(ocrText, rect: rect, page: page, size: size, image: image, digital: hasDigitalText))
+                out.append(contentsOf: styled(ocrText, rect: rect, page: page, size: size, image: image, digital: hasDigitalText))
                 group = []
             }
             for w in words.sorted(by: { $0.rect.minX < $1.rect.minX }) {
@@ -129,29 +130,23 @@ enum LayoutTranslator {
         return height / ratio
     }
 
-    private static func styled(_ ocrText: String, rect inRect: CGRect, page: PDFPage, size: CGSize, image: UIImage, digital: Bool) -> Segment {
-        var rect = inRect
-        var text = ocrText
+    private static func styled(_ ocrText: String, rect inRect: CGRect, page: PDFPage, size: CGSize, image: UIImage, digital: Bool) -> [Segment] {
         var name = "Helvetica"
         var fsize = estimateSize(ocrText, height: inRect.height)
+        var fromPDF = false
         var bold = false, italic = false
         var color: UIColor?
+        var pieces: [(text: String, rect: CGRect)] = [(ocrText, inRect)]
+
         if digital {
-            let norm = CGRect(x: rect.minX / size.width, y: (rect.minY + rect.height * 0.2) / size.height,
-                              width: rect.width / size.width, height: rect.height * 0.6 / size.height)
+            let norm = CGRect(x: inRect.minX / size.width, y: (inRect.minY + inRect.height * 0.2) / size.height,
+                              width: inRect.width / size.width, height: inRect.height * 0.6 / size.height)
             let pr = PageRenderer.pageRect(fromDisplay: norm, on: page)
             if let sel = page.selection(for: pr) {
                 let digitalText = (sel.string ?? "").components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
                 if similar(digitalText, ocrText) {
-                    text = digitalText
-                    // The PDF knows exactly where its own text is; use that box when it agrees.
-                    let n = PageRenderer.displayRect(fromPage: sel.bounds(for: page), on: page)
-                    let exact = CGRect(x: n.minX * size.width, y: n.minY * size.height, width: n.width * size.width, height: n.height * size.height)
-                    let overlap = exact.intersection(inRect)
-                    if !overlap.isNull, overlap.width * overlap.height > inRect.width * inRect.height * 0.5,
-                       exact.width < inRect.width * 1.4, exact.height < inRect.height * 1.8 {
-                        rect = exact
-                    }
+                    pieces = [(digitalText, inRect)]
+                    if let exact = exactPieces(digitalText, near: inRect, page: page, size: size) { pieces = exact }
                 }
                 if let attr = sel.attributedString, attr.length > 0 {
                     let ns = attr.string as NSString
@@ -159,7 +154,7 @@ enum LayoutTranslator {
                     while k < ns.length - 1, let u = Unicode.Scalar(ns.character(at: k)), CharacterSet.whitespacesAndNewlines.contains(u) { k += 1 }
                     if let f = attr.attribute(.font, at: k, effectiveRange: nil) as? UIFont {
                         name = f.fontName
-                        if f.pointSize > fsize * 0.7 && f.pointSize < fsize * 1.4 { fsize = f.pointSize }
+                        if f.pointSize > fsize * 0.6 && f.pointSize < fsize * 1.5 { fsize = f.pointSize; fromPDF = true }
                         bold = f.fontDescriptor.symbolicTraits.contains(.traitBold)
                     }
                     color = attr.attribute(.foregroundColor, at: k, effectiveRange: nil) as? UIColor
@@ -169,8 +164,65 @@ enum LayoutTranslator {
         let parsed = FontLibrary.parse(name)
         bold = bold || parsed.bold
         italic = parsed.italic
-        return Segment(text: text, rect: rect, fontName: name, size: fsize, bold: bold, italic: italic,
-                       color: color ?? inkColour(rect, size: size, image: image))
+        let ink = color ?? inkColour(inRect, size: size, image: image)
+        return pieces.map { p in
+            Segment(text: p.text, rect: p.rect, fontName: name, size: fsize, bold: bold, italic: italic, color: ink, sizeFromPDF: fromPDF)
+        }
+    }
+
+    /// Finds the text in the PDF's own string and asks PDFKit for exact boxes. Also splits
+    /// "Label : value" rows at a stand-alone colon, so the colon stays where it was.
+    private static func exactPieces(_ text: String, near target: CGRect, page: PDFPage, size: CGSize) -> [(text: String, rect: CGRect)]? {
+        guard let full = page.string, !text.isEmpty else { return nil }
+        let ns = full as NSString
+        let tokens = text.split(separator: " ").map { NSRegularExpression.escapedPattern(for: String($0)) }
+        guard !tokens.isEmpty, let re = try? NSRegularExpression(pattern: tokens.joined(separator: "\\s+")) else { return nil }
+        func box(_ r: NSRange) -> CGRect? {
+            guard r.length > 0, let sel = page.selection(for: r) else { return nil }
+            let n = PageRenderer.displayRect(fromPage: sel.bounds(for: page), on: page)
+            let rect = CGRect(x: n.minX * size.width, y: n.minY * size.height, width: n.width * size.width, height: n.height * size.height)
+            return rect.width > 0 && rect.height > 0 ? rect : nil
+        }
+        // The occurrence that sits where the text was seen on the page.
+        var best: (NSRange, CGRect)?
+        var bestScore: CGFloat = 0
+        for m in re.matches(in: full, range: NSRange(location: 0, length: ns.length)) {
+            guard let r = box(m.range) else { continue }
+            let o = r.intersection(target)
+            let score = o.isNull ? 0 : o.width * o.height
+            if score > bestScore { bestScore = score; best = (m.range, r) }
+        }
+        guard let (range, rect) = best, bestScore > target.width * target.height * 0.3,
+              rect.height < target.height * 2.2 else { return nil }
+
+        // A colon with space (or nothing) before it and space after it divides a table row.
+        let sub = ns.substring(with: range) as NSString
+        func isSpace(_ i: Int) -> Bool {
+            guard let u = Unicode.Scalar(sub.character(at: i)) else { return false }
+            return CharacterSet.whitespacesAndNewlines.contains(u)
+        }
+        var colon = -1
+        for i in 0..<sub.length where sub.character(at: i) == 58 {
+            let before = i == 0 || isSpace(i - 1)
+            let after = i == sub.length - 1 || isSpace(i + 1)
+            if before && after { colon = i; break }
+        }
+        guard colon >= 0 else { return [(text, rect)] }
+        func trimmed(_ start: Int, _ end: Int) -> NSRange? {
+            var s = start, e = end
+            while s < e, isSpace(s) { s += 1 }
+            while e > s, isSpace(e - 1) { e -= 1 }
+            return e > s ? NSRange(location: range.location + s, length: e - s) : nil
+        }
+        var out: [(text: String, rect: CGRect)] = []
+        if let l = trimmed(0, colon), let r = box(l) {
+            out.append((ns.substring(with: l).components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " "), r))
+        }
+        if let r = box(NSRange(location: range.location + colon, length: 1)) { out.append((":", r)) }
+        if let v = trimmed(colon + 1, sub.length), let r = box(v) {
+            out.append((ns.substring(with: v).components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " "), r))
+        }
+        return out.count >= 2 ? out : [(text, rect)]
     }
 
     /// Same words, ignoring case, spacing and punctuation (at least 70% of the recognised words).
@@ -225,9 +277,11 @@ enum LayoutTranslator {
         // Most text on a page shares one body size; snap close guesses to it.
         var segs = input
         var counts: [CGFloat: Int] = [:]
-        for s in segs { counts[(s.size * 2).rounded() / 2, default: 0] += s.text.count }
+        for s in segs where s.sizeFromPDF { counts[(s.size * 2).rounded() / 2, default: 0] += s.text.count }
+        if counts.isEmpty { for s in segs { counts[(s.size * 2).rounded() / 2, default: 0] += s.text.count } }
         if let body = counts.max(by: { $0.value < $1.value })?.key {
-            for i in segs.indices where abs(segs[i].size - body) / body < 0.16 { segs[i].size = body }
+            // Only guessed sizes are snapped; sizes the PDF states are kept as they are.
+            for i in segs.indices where !segs[i].sizeFromPDF && abs(segs[i].size - body) / body < 0.10 { segs[i].size = body }
         }
         let sorted = segs.sorted { a, b in
             abs(a.rect.minY - b.rect.minY) < min(a.rect.height, b.rect.height) * 0.5 ? a.rect.minX < b.rect.minX : a.rect.minY < b.rect.minY
@@ -419,7 +473,10 @@ enum LayoutTranslator {
         var origin = CGPoint(x: b.rect.minX, y: b.rect.minY - max(0, usedFont.ascender - usedFont.capHeight))
         if b.centred { origin.x = b.rect.midX - width / 2 }
         let textRect = CGRect(origin: origin, size: CGSize(width: width, height: max(bounds.height, b.rect.height)))
-        let cover = b.rect.union(textRect).insetBy(dx: -1.5, dy: -1.5)
+        // Cover the original words (and any extra width), but never spill onto the next line.
+        let coverX0 = min(b.rect.minX, textRect.minX), coverX1 = max(b.rect.maxX, textRect.maxX)
+        let cover = CGRect(x: coverX0 - 1.5, y: b.rect.minY - 1.5, width: coverX1 - coverX0 + 3,
+                           height: (b.lineCount == 1 ? b.rect.height : max(b.rect.height, min(bounds.height, b.rect.height * 1.15))) + 3)
         let norm = CGRect(x: b.rect.minX / page.width, y: b.rect.minY / page.height, width: b.rect.width / page.width, height: b.rect.height / page.height)
         ColorSampler.surround(norm, in: paper).setFill()
         ctx.fill(cover)
