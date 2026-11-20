@@ -464,30 +464,22 @@ struct TranslateViewImpl: View {
         }
     }
 
-    /// Indexes of blocks that need translating, page by page.
-    private var pending: [(Int, Int)] {
-        blocks.indices.flatMap { p in blocks[p].indices.filter { blocks[p][$0].needsTranslation }.map { (p, $0) } }
-    }
-
     @MainActor
     private func translateLayout(_ session: TranslationSession) async {
         guard let url = inputs.first else { return }
         do {
-            let todo = pending
-            var done = 0
-            for start in stride(from: 0, to: todo.count, by: 40) {
-                let slice = Array(todo[start..<min(start + 40, todo.count)])
-                state.fraction = Double(done) / Double(max(todo.count, 1))
-                state.text = "Translating \(done + 1)–\(done + slice.count) of \(todo.count) text blocks"
-                let requests = slice.map { TranslationSession.Request(sourceText: blocks[$0.0][$0.1].text, clientIdentifier: "\($0.0)-\($0.1)") }
+            let units = LayoutTranslator.units(blocks)
+            for start in stride(from: 0, to: units.count, by: 40) {
+                let slice = Array(start..<min(start + 40, units.count))
+                state.fraction = Double(start) / Double(max(units.count, 1))
+                state.text = "Translating \(start + 1)–\(start + slice.count) of \(units.count) pieces of text"
+                let requests = slice.map { TranslationSession.Request(sourceText: units[$0].text, clientIdentifier: "\($0)") }
                 let responses = try await session.translations(from: requests)
                 for r in responses {
-                    guard let id = r.clientIdentifier else { continue }
-                    let parts = id.split(separator: "-").compactMap { Int($0) }
-                    guard parts.count == 2 else { continue }
-                    blocks[parts[0]][parts[1]].translated = britishSpelling ? BritishSpelling.convert(r.targetText) : r.targetText
+                    guard let id = r.clientIdentifier, let n = Int(id), n < units.count else { continue }
+                    let text = britishSpelling ? BritishSpelling.convert(r.targetText) : r.targetText
+                    LayoutTranslator.apply(text, to: units[n], in: &blocks)
                 }
-                done += slice.count
             }
             finishLayout(url: url, languageName: choice.rawValue)
         } catch {
@@ -499,26 +491,25 @@ struct TranslateViewImpl: View {
     private func translateLayoutWithAI(url: URL, rep: ProgressReporter) {
         Task { @MainActor in
             do {
-                for p in blocks.indices {
-                    let idx = blocks[p].indices.filter { blocks[p][$0].needsTranslation }
-                    guard !idx.isEmpty else { continue }
-                    // Numbered list so one request covers the whole page.
-                    let list = idx.enumerated().map { "\($0.offset + 1). \(blocks[p][$0.element].text)" }.joined(separator: "\n")
-                    let reply = try await AIEngine.translate(list, into: "Malay (Bahasa Melayu as used in Malaysia). Keep the same numbering, one numbered item per line",
-                                                             progress: rep, label: "Translating page \(p + 1) of \(blocks.count)")
+                let units = LayoutTranslator.units(blocks)
+                let language = "Malay (Bahasa Melayu as used in Malaysia)"
+                for start in stride(from: 0, to: units.count, by: 15) {
+                    let slice = Array(start..<min(start + 15, units.count))
+                    // Numbered list so one request covers many pieces.
+                    let list = slice.enumerated().map { "\($0.offset + 1). \(units[$0.element].text)" }.joined(separator: "\n")
+                    let reply = try await AIEngine.translate(list, into: language + ". Keep the same numbering, one numbered item per line",
+                                                             progress: rep, label: "Translating \(start + 1)–\(start + slice.count) of \(units.count)")
                     var map: [Int: String] = [:]
                     for line in reply.components(separatedBy: "\n") {
                         let t = line.trimmingCharacters(in: .whitespaces)
                         guard let dot = t.firstIndex(of: "."), let n = Int(t[t.startIndex..<dot]) else { continue }
                         map[n] = String(t[t.index(after: dot)...]).trimmingCharacters(in: .whitespaces)
                     }
-                    for (k, i) in idx.enumerated() {
-                        if let m = map[k + 1], !m.isEmpty {
-                            blocks[p][i].translated = m
-                        } else {
-                            blocks[p][i].translated = try await AIEngine.translate(blocks[p][i].text, into: "Malay (Bahasa Melayu as used in Malaysia)",
-                                                                                   progress: rep, label: "Translating page \(p + 1) of \(blocks.count)")
-                        }
+                    for (k, u) in slice.enumerated() {
+                        let text: String
+                        if let m = map[k + 1], !m.isEmpty { text = m }
+                        else { text = try await AIEngine.translate(units[u].text, into: language, progress: rep, label: "Translating \(u + 1) of \(units.count)") }
+                        LayoutTranslator.apply(text, to: units[u], in: &blocks)
                     }
                 }
                 finishLayout(url: url, languageName: "Malay")
