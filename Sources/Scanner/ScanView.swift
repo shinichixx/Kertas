@@ -60,12 +60,6 @@ final class ScanSession: ObservableObject {
         }
     }
 
-    func makePDF(searchable: Bool, size: PDFOps.PageFit, progress: ProgressReporter) -> Data {
-        let images = pages.map { $0.result ?? $0.original }
-        let base = PDFOps.imagesToPDF(images, fit: size, margin: .none, progress: progress)
-        guard searchable, let doc = PDFDocument(data: base) else { return base }
-        return OCR.searchable(doc, progress: progress).0
-    }
 }
 
 struct ScanView: View {
@@ -76,7 +70,9 @@ struct ScanView: View {
     @State private var selected: UUID?
     @State private var adjusting: ScanPage?
     @State private var searchable = true
-    @State private var pageSize: PDFOps.PageFit = .a4
+    @State private var format: ScanFormat = .pdf
+    @State private var pageSize: ScanPageSize = .original
+    @State private var fit: ScanFit = .fit
     @State private var name = ""
     @State private var showResult = false
 
@@ -145,6 +141,7 @@ struct ScanView: View {
             Text("Scan a document").font(.title2.weight(.semibold))
             Text("Use the camera, or pick a photo you already took. Kertas finds the page edges and straightens it like a flatbed scan, however tilted it is.")
                 .font(.subheadline).foregroundStyle(Theme.grey).multilineTextAlignment(.center).padding(.horizontal, 30)
+            straightenNote.padding(.horizontal, 30)
             VStack(spacing: 10) {
                 Button { showCamera = true } label: { Label("Use camera", systemImage: "camera") }
                     .buttonStyle(PrimaryButtonStyle())
@@ -159,8 +156,18 @@ struct ScanView: View {
         }
     }
 
+    private var straightenNote: some View {
+        Label("Text is straightened automatically after you tap Save in the camera.", systemImage: "sparkles")
+            .font(.footnote)
+            .foregroundStyle(Color(hex: 0x791F1F))
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.redSoft, in: RoundedRectangle(cornerRadius: 10))
+    }
+
     private var editor: some View {
         VStack(spacing: 0) {
+            straightenNote.padding(.horizontal).padding(.top, 8)
             ZStack {
                 if let p = current {
                     if let r = p.result {
@@ -243,22 +250,59 @@ struct ScanView: View {
             }
             .frame(height: 72)
 
-            VStack(spacing: 10) {
-                TextField("File name", text: $name, prompt: Text(defaultName))
-                    .textFieldStyle(.roundedBorder)
-                HStack {
-                    Toggle("Searchable text", isOn: $searchable).font(.footnote).fixedSize()
-                    Spacer()
-                    Picker("Page", selection: $pageSize) {
-                        ForEach(PDFOps.PageFit.allCases) { Text($0.rawValue).tag($0) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("File name", text: $name, prompt: Text(defaultName))
+                        .textFieldStyle(.roundedBorder)
+                    SectionLabel("Save as")
+                    Picker("Save as", selection: $format) {
+                        ForEach(ScanFormat.allCases) { Text($0.rawValue).tag($0) }
                     }
-                    .pickerStyle(.menu)
-                }
-                Button { save() } label: { Label("Save PDF (\(session.pages.count) page\(session.pages.count == 1 ? "" : "s"))", systemImage: "doc.badge.arrow.up") }
+                    .pickerStyle(.segmented)
+                    SectionLabel("Page size")
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(ScanPageSize.allCases) { s in
+                                Button { pageSize = s } label: {
+                                    Text(s.rawValue).font(.footnote.weight(.medium))
+                                        .padding(.horizontal, 12).padding(.vertical, 6)
+                                        .foregroundStyle(pageSize == s ? .white : Theme.ink)
+                                        .background(pageSize == s ? Theme.red : Theme.chip, in: Capsule())
+                                }
+                            }
+                        }
+                    }
+                    if pageSize != .original {
+                        SectionLabel("Fit")
+                        HStack(spacing: 8) {
+                            ForEach(ScanFit.allCases) { f in
+                                Button { fit = f } label: {
+                                    VStack(spacing: 2) {
+                                        Text(f.rawValue).font(.footnote.weight(.semibold))
+                                        Text(f.note).font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    .foregroundStyle(Theme.ink)
+                                    .frame(maxWidth: .infinity).padding(.vertical, 8)
+                                    .background(Color.white, in: RoundedRectangle(cornerRadius: 10))
+                                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(fit == f ? Theme.red : Theme.line, lineWidth: fit == f ? 1.5 : 0.5))
+                                }
+                            }
+                        }
+                    }
+                    if format == .pdf {
+                        Toggle("Searchable text", isOn: $searchable).font(.footnote)
+                    } else if session.pages.count > 1 {
+                        Text("One image per page, all saved in one folder.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button { save() } label: {
+                        Label("Save \(format.rawValue) (\(session.pages.count) page\(session.pages.count == 1 ? "" : "s"))", systemImage: "square.and.arrow.down")
+                    }
                     .buttonStyle(PrimaryButtonStyle())
                     .disabled(session.pages.isEmpty || session.pages.contains { $0.result == nil })
+                }
+                .padding()
             }
-            .padding()
+            .frame(maxHeight: 300)
             .background(Color.white)
         }
     }
@@ -278,12 +322,10 @@ struct ScanView: View {
 
     private func save() {
         let fileName = name.trimmingCharacters(in: .whitespaces).isEmpty ? defaultName : name
-        let ocr = searchable, size = pageSize
-        let s = session
-        state.run("Making your PDF") { rep in
-            let data = s.makePDF(searchable: ocr, size: size, progress: rep)
-            let url = try FileStore.save(data, base: fileName, ext: "pdf")
-            return ToolOutput(urls: [url], message: "\(s.pages.count) page\(s.pages.count == 1 ? "" : "s") · \(FileStore.sizeText(FileStore.size(url)))")
+        let ocr = searchable, size = pageSize, fit = fit, format = format
+        let images = session.pages.map { $0.result ?? $0.original }
+        state.run("Saving your \(format.rawValue)") { rep in
+            try ScanExport.save(images, name: fileName, format: format, size: size, fit: fit, searchable: ocr, progress: rep)
         }
     }
 }

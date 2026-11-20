@@ -13,6 +13,7 @@ struct KertasApp: App {
             RootView()
                 .environmentObject(router)
                 .tint(Theme.red)
+                .preferredColorScheme(.light)
                 .onOpenURL { url in
                     if let adopted = FileStore.adopt(url) {
                         router.tab = .files
