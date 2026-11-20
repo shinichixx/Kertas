@@ -58,6 +58,13 @@ struct HomeView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                Image("Wordmark")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(height: 70)
+                    .accessibilityLabel("Kertas")
+                    .padding(.top, 4)
+
                 Button { router.tab = .scan } label: {
                     HStack(spacing: 12) {
                         Image(systemName: "doc.viewfinder").font(.system(size: 26, weight: .medium))
@@ -104,15 +111,8 @@ struct HomeView: View {
             .padding()
         }
         .background(Theme.page)
-        .navigationTitle("")
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                HStack(spacing: 0) {
-                    Text("kertas").font(.system(size: 26, weight: .bold, design: .rounded)).foregroundStyle(Theme.ink)
-                    Text(".").font(.system(size: 26, weight: .bold, design: .rounded)).foregroundStyle(Theme.red)
-                }
-            }
-        }
+        .navigationTitle("Tools")
+        .toolbar(.hidden, for: .navigationBar)
         .navigationDestination(for: Tool.self) { ToolRouter(tool: $0) }
     }
 

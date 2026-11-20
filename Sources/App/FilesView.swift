@@ -46,11 +46,10 @@ struct FilesView: View {
                 Button { showImporter = true } label: { Image(systemName: "plus") }
             }
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.pdf, .image], allowsMultipleSelection: true) { result in
-            if case .success(let urls) = result {
-                for u in urls { _ = FileStore.adopt(u) }
-                reload()
-            }
+        .documentPicker(isPresented: $showImporter, types: [.pdf, .image], multiple: true) { urls in
+            let adopted = urls.compactMap { FileStore.adopt($0) }
+            reload()
+            if adopted.count == 1, adopted[0].pathExtension.lowercased() == "pdf" { open(adopted[0]) }
         }
         .alert("Rename", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Name", text: $newName)

@@ -178,11 +178,8 @@ struct InputPicker: View {
                 }
             }
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: types, allowsMultipleSelection: multiple) { result in
-            if case .success(let picked) = result {
-                let copies = picked.compactMap { FileStore.importCopy($0) }
-                if multiple { urls.append(contentsOf: copies) } else { urls = Array(copies.prefix(1)) }
-            }
+        .documentPicker(isPresented: $showImporter, types: types, multiple: multiple) { copies in
+            if multiple { urls.append(contentsOf: copies) } else { urls = Array(copies.prefix(1)) }
         }
         .onChange(of: photoItems) { _, items in
             guard !items.isEmpty else { return }

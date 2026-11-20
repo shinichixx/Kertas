@@ -95,7 +95,7 @@ struct EditorView: View {
             TextEditSheet(model: model, itemID: box.id)
         }
         .sheet(isPresented: $showSignature) {
-            SignatureSheet { img in placeImage(img, width: 0.35) }
+            SignatureSheet { img in placeSignature(img) }
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $photoItem, matching: .images)
         .onChange(of: photoItem) { _, item in
@@ -225,6 +225,14 @@ struct EditorView: View {
             .padding(.horizontal)
             Text("Page \(model.pageIndex + 1) of \(model.doc.pageCount)").font(.caption2).foregroundStyle(.secondary)
 
+            if model.tool == .sign {
+                Button { showSignature = true } label: { Label("Change signature", systemImage: "signature") }
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 14).padding(.vertical, 6)
+                    .background(Theme.chip, in: Capsule())
+                    .foregroundStyle(Theme.ink)
+            }
+
             if model.tool == .draw {
                 HStack(spacing: 14) {
                     ForEach([UIColor.black, UIColor(red: 0.1, green: 0.25, blue: 0.75, alpha: 1), UIColor(red: 0.85, green: 0.15, blue: 0.15, alpha: 1), UIColor(red: 0.1, green: 0.55, blue: 0.25, alpha: 1)], id: \.self) { c in
@@ -246,7 +254,9 @@ struct EditorView: View {
                             model.tool = t
                             model.selected = nil
                             if t == .image { showPhotoPicker = true }
-                            if t == .sign { showSignature = true }
+                            if t == .sign {
+                                if let img = SignatureStore.defaultImage { placeSignature(img) } else { showSignature = true }
+                            }
                         } label: {
                             VStack(spacing: 4) {
                                 Image(systemName: t.icon).font(.system(size: 18))
@@ -335,6 +345,21 @@ struct EditorView: View {
         let h = width * (img.size.height / max(img.size.width, 1)) * (ps.width / ps.height)
         model.add(EditItem(kind: .image, page: model.pageIndex, rect: CGRect(x: 0.5 - width / 2, y: 0.5 - h / 2, width: width, height: h), image: img))
         model.tool = .select
+    }
+
+    /// Replaces the selected signature, or drops a new one in the middle of the page.
+    private func placeSignature(_ img: UIImage) {
+        if let id = model.selected, let item = model.items.first(where: { $0.id == id }), item.kind == .image {
+            model.snapshot()
+            let ps = model.pageSize
+            model.update(id) { it in
+                it.image = img
+                it.rect.size.height = it.rect.width * (img.size.height / max(img.size.width, 1)) * (ps.width / ps.height)
+            }
+        } else {
+            placeImage(img, width: 0.35)
+        }
+        model.tool = .sign
     }
 
     private func runRedactSearch() {

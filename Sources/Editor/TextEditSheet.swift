@@ -111,10 +111,9 @@ struct TextEditSheet: View {
             .alert("Font", isPresented: Binding(get: { problem != nil }, set: { if !$0 { problem = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: { Text(problem ?? "") }
-            .fileImporter(isPresented: $showImport, allowedContentTypes: [.font, UTType(filenameExtension: "ttf") ?? .data, UTType(filenameExtension: "otf") ?? .data]) { result in
-                if case .success(let url) = result {
-                    do { family = try lib.importFont(url) } catch { problem = error.localizedDescription }
-                }
+            .documentPicker(isPresented: $showImport, types: [.font, UTType(filenameExtension: "ttf") ?? .data, UTType(filenameExtension: "otf") ?? .data]) { urls in
+                guard let url = urls.first else { return }
+                do { family = try lib.importFont(url) } catch { problem = error.localizedDescription }
             }
         }
         .onAppear(perform: load)
@@ -289,13 +288,82 @@ struct FontSearchView: View {
 
 enum SignatureStore {
     static var dir: URL { FileStore.support("Signatures") }
+    private static let defaultKey = "defaultSignature"
+
     static func all() -> [URL] {
         ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
             .filter { $0.pathExtension == "png" }
             .sorted { FileStore.modified($0) > FileStore.modified($1) }
     }
-    static func save(_ img: UIImage) {
-        if let d = img.pngData() { try? d.write(to: dir.appendingPathComponent(UUID().uuidString + ".png")) }
+
+    @discardableResult
+    static func save(_ img: UIImage) -> URL? {
+        guard let d = img.pngData() else { return nil }
+        let url = dir.appendingPathComponent(UUID().uuidString + ".png")
+        do { try d.write(to: url) } catch { return nil }
+        if defaultURL == nil { setDefault(url) }
+        return url
+    }
+
+    static var defaultURL: URL? {
+        guard let name = UserDefaults.standard.string(forKey: defaultKey) else { return nil }
+        let url = dir.appendingPathComponent(name)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    static var defaultImage: UIImage? { defaultURL.flatMap { UIImage(contentsOfFile: $0.path) } }
+
+    static func setDefault(_ url: URL?) {
+        UserDefaults.standard.set(url?.lastPathComponent, forKey: defaultKey)
+    }
+
+    static func delete(_ url: URL) {
+        if defaultURL == url { setDefault(nil) }
+        try? FileManager.default.removeItem(at: url)
+        if defaultURL == nil, let first = all().first { setDefault(first) }
+    }
+
+    /// Makes white or light paper see-through and trims the empty edges,
+    /// so a photo or scan of a signature sits cleanly on the page.
+    static func cleaned(_ source: UIImage) -> UIImage {
+        let img = source.normalized(maxSide: 1600)
+        guard let cg = img.cgImage else { return img }
+        let w = cg.width, h = cg.height
+        var buf = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return img }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+        // Only knock out the background when there's no transparency already.
+        var hasAlpha = false
+        for i in stride(from: 3, to: buf.count, by: 4 * 7) where buf[i] < 250 { hasAlpha = true; break }
+
+        var minX = w, minY = h, maxX = -1, maxY = -1
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 4
+                if !hasAlpha {
+                    let r = Double(buf[i]), g = Double(buf[i + 1]), b = Double(buf[i + 2])
+                    let lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+                    // Paper → clear, ink → solid, a soft ramp in between keeps edges smooth.
+                    let a = lum > 0.82 ? 0.0 : (lum < 0.55 ? 1.0 : (0.82 - lum) / 0.27)
+                    let alpha = UInt8(a * 255)
+                    buf[i] = UInt8(r * a); buf[i + 1] = UInt8(g * a); buf[i + 2] = UInt8(b * a); buf[i + 3] = alpha
+                }
+                if buf[i + 3] > 24 {
+                    if x < minX { minX = x }; if x > maxX { maxX = x }
+                    if y < minY { minY = y }; if y > maxY { maxY = y }
+                }
+            }
+        }
+        guard maxX > minX, maxY > minY, let out = ctx.makeImage() else { return img }
+        let pad = 8
+        let crop = CGRect(x: max(minX - pad, 0), y: max(minY - pad, 0),
+                          width: min(maxX - minX + 2 * pad, w - max(minX - pad, 0)),
+                          height: min(maxY - minY + 2 * pad, h - max(minY - pad, 0)))
+        guard let cropped = out.cropping(to: crop) else { return UIImage(cgImage: out) }
+        return UIImage(cgImage: cropped)
     }
 }
 
@@ -303,14 +371,16 @@ struct SignatureSheet: View {
     var onPick: (UIImage) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var saved: [URL] = SignatureStore.all()
+    @State private var defaultURL: URL? = SignatureStore.defaultURL
     @State private var drawing = PKDrawing()
     @State private var ink: UIColor = .black
     @State private var drawingNew = false
+    @State private var showImport = false
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 14) {
-                if drawingNew || saved.isEmpty {
+                if drawingNew {
                     Text("Sign inside the box").font(.subheadline).foregroundStyle(.secondary)
                     SignaturePad(drawing: $drawing, color: ink)
                         .frame(height: 220)
@@ -334,23 +404,29 @@ struct SignatureSheet: View {
                     }
                     .buttonStyle(PrimaryButtonStyle())
                     .disabled(drawing.strokes.isEmpty)
+                    Button("Back") { drawingNew = false; drawing = PKDrawing() }.font(.subheadline)
                 } else {
-                    ScrollView {
-                        VStack(spacing: 10) {
-                            ForEach(saved, id: \.self) { url in
-                                if let img = UIImage(contentsOfFile: url.path) {
-                                    Button { onPick(img); dismiss() } label: {
-                                        Image(uiImage: img).resizable().scaledToFit().frame(height: 80).frame(maxWidth: .infinity)
-                                            .padding(10).background(Color.white, in: RoundedRectangle(cornerRadius: 12))
-                                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.line))
-                                    }
-                                    .contextMenu {
-                                        Button(role: .destructive) { try? FileManager.default.removeItem(at: url); saved = SignatureStore.all() } label: { Label("Delete", systemImage: "trash") }
-                                    }
+                    if saved.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: "signature").font(.system(size: 40)).foregroundStyle(Theme.red)
+                            Text("No signature yet").font(.headline)
+                            Text("Import a picture of your signature, or draw one with your finger.")
+                                .font(.subheadline).foregroundStyle(Theme.grey).multilineTextAlignment(.center)
+                        }
+                        .padding(.vertical, 24)
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 10) {
+                                ForEach(saved, id: \.self) { url in
+                                    if let img = UIImage(contentsOfFile: url.path) { row(url, img) }
                                 }
                             }
                         }
+                        Text("Tap a signature to use it. Tap the star to make it your default, so Sign places it straight away.")
+                            .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     }
+                    Button { showImport = true } label: { Label("Import signature", systemImage: "square.and.arrow.down") }
+                        .buttonStyle(PrimaryButtonStyle())
                     Button { drawingNew = true } label: { Label("Draw a new signature", systemImage: "signature") }
                         .buttonStyle(SecondaryButtonStyle())
                 }
@@ -361,7 +437,49 @@ struct SignatureSheet: View {
             .navigationTitle("Signature")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .documentPicker(isPresented: $showImport, types: [.png, .jpeg, .heic, .image]) { urls in
+                guard let url = urls.first, let raw = UIImage(contentsOfFile: url.path) else { return }
+                let img = SignatureStore.cleaned(raw)
+                if let saved = SignatureStore.save(img) {
+                    SignatureStore.setDefault(saved)
+                }
+                reload()
+            }
         }
+    }
+
+    private func row(_ url: URL, _ img: UIImage) -> some View {
+        let isDefault = url == defaultURL
+        return Button { onPick(img); dismiss() } label: {
+            Image(uiImage: img).resizable().scaledToFit().frame(height: 80).frame(maxWidth: .infinity)
+                .padding(10)
+                .background(Color.white, in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(isDefault ? Theme.red : Theme.line, lineWidth: isDefault ? 1.5 : 0.5))
+                .overlay(alignment: .topTrailing) {
+                    Button {
+                        SignatureStore.setDefault(url)
+                        reload()
+                    } label: {
+                        if isDefault {
+                            Label("Default", systemImage: "star.fill").font(.caption2.bold()).foregroundStyle(.white)
+                                .padding(.horizontal, 8).padding(.vertical, 3).background(Theme.red, in: Capsule())
+                        } else {
+                            Image(systemName: "star").foregroundStyle(Theme.grey).padding(4)
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .padding(6)
+                }
+        }
+        .contextMenu {
+            Button { SignatureStore.setDefault(url); reload() } label: { Label("Make default", systemImage: "star") }
+            Button(role: .destructive) { SignatureStore.delete(url); reload() } label: { Label("Delete", systemImage: "trash") }
+        }
+    }
+
+    private func reload() {
+        saved = SignatureStore.all()
+        defaultURL = SignatureStore.defaultURL
     }
 
     private func trimmed() -> UIImage? {

@@ -94,7 +94,12 @@ enum FileStore {
     static func adopt(_ url: URL) -> URL? {
         guard let copy = importCopy(url) else { return nil }
         let dest = uniqueURL(base: url.deletingPathExtension().lastPathComponent, ext: url.pathExtension.isEmpty ? "pdf" : url.pathExtension)
-        do { try FileManager.default.moveItem(at: copy, to: dest); notify(); return dest } catch { return nil }
+        do {
+            try FileManager.default.moveItem(at: copy, to: dest)
+            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: dest.path)
+            notify()
+            return dest
+        } catch { return nil }
     }
 
     static func list() -> [URL] {
