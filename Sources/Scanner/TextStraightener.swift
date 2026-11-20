@@ -50,7 +50,7 @@ enum TextStraightener {
         let hSum = cues.reduce(0) { $0 + $1.w }
         let vSum = verticals.reduce(0) { $0 + $1.w }
         if vSum > 0 {
-            let scale = hSum / vSum
+            let scale = 0.5 * hSum / vSum
             cues += verticals.map { var c = $0; c.w *= scale; return c }
         }
 
@@ -62,10 +62,11 @@ enum TextStraightener {
             n.b = SIMD2((c.b.x - cx) / s, (c.b.y - cy) / s)
             return n
         }
-        let before = meanError([0, 0, 0, 0], norm)
+        let lines = norm.filter(\.horizontal)
+        let before = meanError([0, 0, 0, 0], lines)
         let p = solve(norm)
-        let after = meanError(p, norm)
-        guard p.allSatisfy({ abs($0) < 0.25 }), after < before * 0.8, before > 0.004 else { return image }
+        let after = meanError(p, lines)
+        guard p.allSatisfy({ abs($0) < 0.25 }), before > 0.004, after < before * 0.75 else { return image }
 
         // 5. Apply the same correction to the full-size image.
         return apply(p, to: image, cg: full)
@@ -89,9 +90,11 @@ enum TextStraightener {
                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
     }
 
-    /// Fits a line through the bottom of the ink in a text box (ignoring descenders).
+    /// Measures the slope of the text in a box with the projection-profile method:
+    /// the angle at which the rows of ink stack up most sharply is the line angle.
+    /// Robust to descenders, accents and two lines sharing one box.
     private static func baseline(in box: CGRect, gray: [UInt8], w: Int, h: Int) -> Cue? {
-        let r = box.insetBy(dx: 0, dy: -box.height * 0.3)
+        let r = box.insetBy(dx: 0, dy: -box.height * 0.15)
         let x0 = max(Int(r.minX), 0), x1 = min(Int(r.maxX), w - 1)
         let y0 = max(Int(r.minY), 0), y1 = min(Int(r.maxY), h - 1)
         guard x1 - x0 > 20, y1 - y0 > 4 else { return nil }
@@ -116,27 +119,37 @@ enum TextStraightener {
         let inkIsDark = dark < total / 2
 
         var xs: [Double] = [], ys: [Double] = []
-        for x in x0...x1 {
-            var y = y1
-            while y >= y0 {
+        for y in y0...y1 {
+            for x in x0...x1 {
                 let v = Int(gray[y * w + x])
-                if inkIsDark ? v <= t : v > t { break }
-                y -= 1
+                if inkIsDark ? v <= t : v > t { xs.append(Double(x)); ys.append(Double(y)) }
             }
-            if y >= y0 { xs.append(Double(x)); ys.append(Double(y)) }
         }
-        guard xs.count > (x1 - x0) / 4 else { return nil }
-        guard let first = fit(xs, ys) else { return nil }
-        var (m, c) = first
-        // Drop descenders and stray marks, then refit.
-        let res = zip(xs, ys).map { abs($0.1 - (m * $0.0 + c)) }
-        let cut = res.sorted()[Int(Double(res.count) * 0.7)] + 1
-        let keep = res.indices.filter { res[$0] <= cut }
-        guard keep.count > 10, let refit = fit(keep.map { xs[$0] }, keep.map { ys[$0] }) else { return nil }
-        (m, c) = refit
-        guard abs(m) < 0.3 else { return nil }
-        let a = SIMD2(Double(x0), m * Double(x0) + c), b = SIMD2(Double(x1), m * Double(x1) + c)
-        return Cue(a: a, b: b, w: Double(x1 - x0), horizontal: true)
+        guard xs.count > 50 else { return nil }
+        if xs.count > 6000 {
+            let step = Double(xs.count - 1) / 5999
+            let idx = (0..<6000).map { Int(Double($0) * step) }
+            xs = idx.map { xs[$0] }; ys = idx.map { ys[$0] }
+        }
+        let mx = xs.reduce(0, +) / Double(xs.count), my = ys.reduce(0, +) / Double(ys.count)
+        let height = y1 - y0 + 1
+        let width = Double(x1 - x0)
+        var bestScore = -1.0, bestM = 0.0
+        var m = -0.12
+        while m <= 0.1201 {
+            var bins = [Int](repeating: 0, count: height + Int(width * 0.13) * 2 + 4)
+            let off = Int(width * 0.13) + 2
+            for i in xs.indices {
+                let yy = Int((ys[i] - Double(y0) - m * (xs[i] - mx)).rounded()) + off
+                if yy >= 0 && yy < bins.count { bins[yy] += 1 }
+            }
+            var score = 0.0
+            for b in bins { score += Double(b * b) }
+            if score > bestScore { bestScore = score; bestM = m }
+            m += 0.0015
+        }
+        let half = width / 2
+        return Cue(a: SIMD2(mx - half, my - bestM * half), b: SIMD2(mx + half, my + bestM * half), w: width, horizontal: true)
     }
 
     private static func fit(_ xs: [Double], _ ys: [Double]) -> (Double, Double)? {
