@@ -124,8 +124,17 @@ enum LayoutTranslator {
         let sorted = segs.sorted { a, b in
             abs(a.rect.minY - b.rect.minY) < min(a.rect.height, b.rect.height) * 0.5 ? a.rect.minX < b.rect.minX : a.rect.minY < b.rect.minY
         }
-        var blocks: [(segs: [Segment], rect: CGRect)] = []
-        for s in sorted {
+        // The right edge of the text column: paragraph lines (except the last) reach it.
+        let rights = sorted.map(\.rect.maxX).sorted()
+        let textRight = rights.isEmpty ? pageWidth : rights[min(rights.count - 1, Int(Double(rights.count) * 0.95))]
+        // Pieces that share a line with another piece are table cells, never paragraph lines.
+        let cells: [Bool] = sorted.indices.map { i in
+            sorted.indices.contains { j in
+                j != i && abs(sorted[j].rect.midY - sorted[i].rect.midY) < sorted[i].rect.height * 0.5
+            }
+        }
+        var blocks: [(segs: [Segment], rect: CGRect, cell: Bool)] = []
+        for (n, s) in sorted.enumerated() {
             var placed = false
             for k in blocks.indices.reversed() {
                 let b = blocks[k]
@@ -134,10 +143,10 @@ enum LayoutTranslator {
                 let leftAligned = abs(b.rect.minX - s.rect.minX) < max(3, s.size * 0.4)
                 let gap = s.rect.minY - last.rect.maxY
                 let close = gap > -s.size * 0.3 && gap < s.size * 0.9
-                // A line that stopped well short of the block's right edge ended its paragraph.
-                let previousWasFull = last.rect.maxX > b.rect.maxX - max(s.size * 4, b.rect.width * 0.15)
+                // A line that stopped short of the text column's right edge ended its paragraph.
+                let previousWasFull = last.rect.maxX > textRight - s.size * 3
                 let wideEnough = b.rect.width > s.size * 12
-                if sameStyle && leftAligned && close && previousWasFull && wideEnough {
+                if sameStyle && leftAligned && close && previousWasFull && wideEnough && !cells[n] && !b.cell {
                     blocks[k].segs.append(s)
                     blocks[k].rect = b.rect.union(s.rect)
                     placed = true
@@ -145,7 +154,7 @@ enum LayoutTranslator {
                 }
                 if s.rect.minY - b.rect.maxY > s.size * 3 { break }
             }
-            if !placed { blocks.append(([s], s.rect)) }
+            if !placed { blocks.append(([s], s.rect, cells[n])) }
         }
         return blocks.map { b in
             var text = ""
